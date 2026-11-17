@@ -2656,6 +2656,344 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * =============================================================================
+ * Collision detection: spheres and capsules
+ * =============================================================================
+ *
+ * A capsule is a line segment swept by a radius. A capsule whose two
+ * endpoints coincide is a zero-length capsule; every test below treats it
+ * exactly like a sphere with the same center and radius.
+ *
+ * Each test returns an HMM_Contact:
+ *
+ *   Intersect - nonzero when the shapes overlap or are exactly tangent.
+ *   PointA    - closest point on the center feature of the first shape: the
+ *               sphere center, or the closest point on the capsule segment.
+ *   PointB    - closest point on the center feature of the second shape.
+ *   Normal    - unit vector pointing from the first shape toward the second
+ *               one, (PointB - PointA) normalized; the zero vector when the
+ *               two features coincide, or when ComputeNormal is zero.
+ *   Depth     - penetration depth. With HMM_DEPTH_SIGNED it is positive for
+ *               overlap, zero when tangent, and negative (the separation
+ *               distance) when disjoint. With HMM_DEPTH_CLAMPED it is zero
+ *               for tangent and disjoint pairs.
+ *
+ * The actual surface contact points are PointA + Normal * RadiusA and
+ * PointB - Normal * RadiusB. With ComputeNormal disabled and
+ * HMM_DEPTH_CLAMPED, a disjoint pair can be rejected using squared
+ * distances alone, with no square root.
+ */
+
+typedef struct HMM_Sphere
+{
+    HMM_Vec3 Center;
+    float Radius;
+} HMM_Sphere;
+
+typedef struct HMM_Capsule
+{
+    HMM_Vec3 A;
+    HMM_Vec3 B;
+    float Radius;
+} HMM_Capsule;
+
+typedef enum HMM_DepthMode
+{
+    HMM_DEPTH_SIGNED = 0,
+    HMM_DEPTH_CLAMPED = 1
+} HMM_DepthMode;
+
+typedef struct HMM_CollideOptions
+{
+    int ComputeNormal;
+    HMM_DepthMode DepthMode;
+} HMM_CollideOptions;
+
+typedef struct HMM_Contact
+{
+    int Intersect;
+    HMM_Vec3 PointA;
+    HMM_Vec3 PointB;
+    HMM_Vec3 Normal;
+    float Depth;
+} HMM_Contact;
+
+static inline HMM_CollideOptions HMM_DefaultCollideOptions(void)
+{
+    HMM_CollideOptions Options;
+    Options.ComputeNormal = 1;
+    Options.DepthMode = HMM_DEPTH_SIGNED;
+    return Options;
+}
+
+/* Closest point to P on the segment A-B. A zero-length segment returns A. */
+static inline HMM_Vec3 HMM__ClosestPointOnSegment(HMM_Vec3 P,
+                                                  HMM_Vec3 A, HMM_Vec3 B)
+{
+    HMM_Vec3 AB = HMM_SubV3(B, A);
+    float LengthSquared = HMM_DotV3(AB, AB);
+
+    if (LengthSquared == 0.0f)
+    {
+        return A;
+    }
+
+    float T = HMM_Clamp(0.0f,
+                        HMM_DotV3(HMM_SubV3(P, A), AB) / LengthSquared,
+                        1.0f);
+    return HMM_AddV3(A, HMM_MulV3F(AB, T));
+}
+
+/*
+ * Closest pair of points between two segments. Follows the clamped
+ * segment-segment algorithm from Real-Time Collision Detection (Ericson),
+ * and handles zero-length segments on either side.
+ */
+static inline void HMM__SegmentSegmentClosest(HMM_Vec3 P1, HMM_Vec3 Q1,
+                                              HMM_Vec3 P2, HMM_Vec3 Q2,
+                                              HMM_Vec3 *C1, HMM_Vec3 *C2)
+{
+    HMM_Vec3 D1 = HMM_SubV3(Q1, P1);
+    HMM_Vec3 D2 = HMM_SubV3(Q2, P2);
+    HMM_Vec3 R = HMM_SubV3(P1, P2);
+    float A = HMM_DotV3(D1, D1);
+    float E = HMM_DotV3(D2, D2);
+    float F = HMM_DotV3(D2, R);
+    float S, T;
+
+    if (A == 0.0f && E == 0.0f)
+    {
+        /* Both segments are zero-length. */
+        S = 0.0f;
+        T = 0.0f;
+    }
+    else if (A == 0.0f)
+    {
+        /* First segment is zero-length: just project onto the second one. */
+        S = 0.0f;
+        T = HMM_Clamp(0.0f, F / E, 1.0f);
+    }
+    else if (E == 0.0f)
+    {
+        /* Second segment is zero-length: just project onto the first one. */
+        T = 0.0f;
+        S = HMM_Clamp(0.0f, -HMM_DotV3(D1, R) / A, 1.0f);
+    }
+    else
+    {
+        float B = HMM_DotV3(D1, D2);
+        float C = HMM_DotV3(D1, R);
+        float Denom = A * E - B * B;
+
+        if (Denom != 0.0f)
+        {
+            S = HMM_Clamp(0.0f, (B * F - C * E) / Denom, 1.0f);
+        }
+        else
+        {
+            /* Parallel segments: an arbitrary interior S works; use the start. */
+            S = 0.0f;
+        }
+        T = (B * S + F) / E;
+
+        if (T < 0.0f)
+        {
+            T = 0.0f;
+            S = HMM_Clamp(0.0f, -C / A, 1.0f);
+        }
+        else if (T > 1.0f)
+        {
+            T = 1.0f;
+            S = HMM_Clamp(0.0f, (B - C) / A, 1.0f);
+        }
+    }
+
+    *C1 = HMM_AddV3(P1, HMM_MulV3F(D1, S));
+    *C2 = HMM_AddV3(P2, HMM_MulV3F(D2, T));
+}
+
+/*
+ * Shared contact kernel for every pair type. C1/C2 are the closest feature
+ * points (sphere centers or capsule segment points), R1/R2 the radii. The
+ * scalar entry points and the batch entry points all call this function, so
+ * a given pair always produces identical results either way.
+ */
+static inline HMM_Contact HMM__MakeContact(HMM_Vec3 C1, float R1,
+                                           HMM_Vec3 C2, float R2,
+                                           int ComputeNormal, int ClampDepth)
+{
+    HMM_Contact Contact;
+    HMM_Vec3 Delta = HMM_SubV3(C2, C1);
+    float DistanceSquared = HMM_DotV3(Delta, Delta);
+    float RadiusSum = R1 + R2;
+    float RadiusSumSquared = RadiusSum * RadiusSum;
+
+    Contact.PointA = C1;
+    Contact.PointB = C2;
+    Contact.Normal = HMM_V3(0.0f, 0.0f, 0.0f);
+
+    if (DistanceSquared > RadiusSumSquared)
+    {
+        Contact.Intersect = 0;
+
+        /*
+         * Disjoint pair. With clamped depth and no normal requested, neither
+         * the depth nor any output field needs a square root.
+         */
+        if (ClampDepth && !ComputeNormal)
+        {
+            Contact.Depth = 0.0f;
+            return Contact;
+        }
+    }
+    else
+    {
+        /* Overlap or exact tangency both count as an intersection. */
+        Contact.Intersect = 1;
+    }
+
+    {
+        float Distance = HMM_SqrtF(DistanceSquared);
+        float SignedDepth = RadiusSum - Distance;
+
+        Contact.Depth = ClampDepth ? HMM_MAX(0.0f, SignedDepth) : SignedDepth;
+
+        if (ComputeNormal && Distance != 0.0f)
+        {
+            Contact.Normal = HMM_MulV3F(Delta, 1.0f / Distance);
+        }
+    }
+
+    return Contact;
+}
+
+/*
+ * Sphere-sphere
+ */
+
+static inline HMM_Contact HMM_CollideSphereSphereEx(HMM_Sphere S1,
+                                                    HMM_Sphere S2,
+                                                    HMM_CollideOptions Options)
+{
+    return HMM__MakeContact(S1.Center, S1.Radius,
+                            S2.Center, S2.Radius,
+                            Options.ComputeNormal,
+                            Options.DepthMode == HMM_DEPTH_CLAMPED);
+}
+
+static inline HMM_Contact HMM_CollideSphereSphere(HMM_Sphere S1, HMM_Sphere S2)
+{
+    return HMM_CollideSphereSphereEx(S1, S2, HMM_DefaultCollideOptions());
+}
+
+static inline void HMM_CollideSphereSphereBatch(const HMM_Sphere *S1,
+                                                const HMM_Sphere *S2,
+                                                HMM_Contact *Out,
+                                                int Count,
+                                                HMM_CollideOptions Options)
+{
+    int ComputeNormal = Options.ComputeNormal;
+    int ClampDepth = (Options.DepthMode == HMM_DEPTH_CLAMPED);
+    int I;
+
+    for (I = 0; I < Count; ++I)
+    {
+        Out[I] = HMM__MakeContact(S1[I].Center, S1[I].Radius,
+                                  S2[I].Center, S2[I].Radius,
+                                  ComputeNormal, ClampDepth);
+    }
+}
+
+/*
+ * Sphere-capsule. The sphere is always the first shape, so HMM_Contact.PointA
+ * is the sphere center and PointB is the closest point on the capsule segment.
+ */
+
+static inline HMM_Contact HMM_CollideSphereCapsuleEx(HMM_Sphere S,
+                                                     HMM_Capsule C,
+                                                     HMM_CollideOptions Options)
+{
+    HMM_Vec3 Closest = HMM__ClosestPointOnSegment(S.Center, C.A, C.B);
+
+    return HMM__MakeContact(S.Center, S.Radius,
+                            Closest, C.Radius,
+                            Options.ComputeNormal,
+                            Options.DepthMode == HMM_DEPTH_CLAMPED);
+}
+
+static inline HMM_Contact HMM_CollideSphereCapsule(HMM_Sphere S, HMM_Capsule C)
+{
+    return HMM_CollideSphereCapsuleEx(S, C, HMM_DefaultCollideOptions());
+}
+
+static inline void HMM_CollideSphereCapsuleBatch(const HMM_Sphere *S,
+                                                 const HMM_Capsule *C,
+                                                 HMM_Contact *Out,
+                                                 int Count,
+                                                 HMM_CollideOptions Options)
+{
+    int ComputeNormal = Options.ComputeNormal;
+    int ClampDepth = (Options.DepthMode == HMM_DEPTH_CLAMPED);
+    int I;
+
+    for (I = 0; I < Count; ++I)
+    {
+        HMM_Vec3 Closest = HMM__ClosestPointOnSegment(S[I].Center,
+                                                      C[I].A, C[I].B);
+        Out[I] = HMM__MakeContact(S[I].Center, S[I].Radius,
+                                  Closest, C[I].Radius,
+                                  ComputeNormal, ClampDepth);
+    }
+}
+
+/*
+ * Capsule-capsule
+ */
+
+static inline HMM_Contact HMM_CollideCapsuleCapsuleEx(HMM_Capsule C1,
+                                                      HMM_Capsule C2,
+                                                      HMM_CollideOptions Options)
+{
+    HMM_Vec3 Closest1, Closest2;
+
+    HMM__SegmentSegmentClosest(C1.A, C1.B, C2.A, C2.B, &Closest1, &Closest2);
+
+    return HMM__MakeContact(Closest1, C1.Radius,
+                            Closest2, C2.Radius,
+                            Options.ComputeNormal,
+                            Options.DepthMode == HMM_DEPTH_CLAMPED);
+}
+
+static inline HMM_Contact HMM_CollideCapsuleCapsule(HMM_Capsule C1,
+                                                     HMM_Capsule C2)
+{
+    return HMM_CollideCapsuleCapsuleEx(C1, C2, HMM_DefaultCollideOptions());
+}
+
+static inline void HMM_CollideCapsuleCapsuleBatch(const HMM_Capsule *C1,
+                                                  const HMM_Capsule *C2,
+                                                  HMM_Contact *Out,
+                                                  int Count,
+                                                  HMM_CollideOptions Options)
+{
+    int ComputeNormal = Options.ComputeNormal;
+    int ClampDepth = (Options.DepthMode == HMM_DEPTH_CLAMPED);
+    int I;
+
+    for (I = 0; I < Count; ++I)
+    {
+        HMM_Vec3 Closest1, Closest2;
+
+        HMM__SegmentSegmentClosest(C1[I].A, C1[I].B,
+                                   C2[I].A, C2[I].B,
+                                   &Closest1, &Closest2);
+        Out[I] = HMM__MakeContact(Closest1, C1[I].Radius,
+                                  Closest2, C2[I].Radius,
+                                  ComputeNormal, ClampDepth);
+    }
+}
+
 
 #ifdef __cplusplus
 }
