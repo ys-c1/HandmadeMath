@@ -1722,6 +1722,420 @@ static inline HMM_Mat4 HMM_InvGeneralM4(HMM_Mat4 Matrix)
 }
 
 /*
+ * Batch normal matrices
+ *
+ * A normal matrix is the inverse transpose of the upper-left 3x3 linear part
+ * of a model transform. Inverting the full 3x3 linear part (rather than just
+ * its diagonal) correctly handles non-uniform scale and shear.
+ *
+ * Singular transforms (determinant zero or close to zero) cannot be inverted.
+ * Instead of returning NaNs or infinities, HMM_NormalMatrixM4 regularizes the
+ * linear part by adding a small diagonal term, reports
+ * HMM_NormalMatrixStatus_Degenerate through the optional status out-parameter,
+ * and still returns a finite, usable direction. If even the regularized matrix
+ * cannot be inverted, the identity matrix is returned as a last resort. All
+ * entry points below therefore produce finite outputs for finite inputs.
+ *
+ * Config:
+ *   BatchSize            number of elements processed per chunk (<= 0 means
+ *                        the whole batch at once). Results are bitwise
+ *                        independent of this value.
+ *   Normalize            normalize the normal vectors produced by
+ *                        HMM_NormalM4 / HMM_NormalBatchM4. Normal matrix
+ *                        columns are never rescaled, since that would change
+ *                        the geometric transform.
+ *   DeterminantEpsilon   relative degeneracy threshold (<= 0 selects
+ *                        HMM_NORMAL_MATRIX_DEFAULT_EPSILON). A transform is
+ *                        degenerate when |det| <= eps * maxAbs^3.
+ */
+
+#ifndef HMM_NORMAL_MATRIX_DEFAULT_EPSILON
+# define HMM_NORMAL_MATRIX_DEFAULT_EPSILON 0.000001f
+#endif
+
+#ifndef HMM_NORMAL_MATRIX_MAX_VALUE
+# define HMM_NORMAL_MATRIX_MAX_VALUE 3.0e38f
+#endif
+
+typedef enum HMM_NormalMatrixStatus
+{
+    HMM_NormalMatrixStatus_Ok = 0,
+    HMM_NormalMatrixStatus_Degenerate = 1
+} HMM_NormalMatrixStatus;
+
+typedef struct HMM_NormalMatrixConfig
+{
+    int BatchSize;
+    HMM_Bool Normalize;
+    float DeterminantEpsilon;
+} HMM_NormalMatrixConfig;
+
+static inline HMM_NormalMatrixConfig HMM_NormalMatrixConfigDefault(void)
+{
+    HMM_NormalMatrixConfig Config;
+    Config.BatchSize = 0;
+    Config.Normalize = 0;
+    Config.DeterminantEpsilon = HMM_NORMAL_MATRIX_DEFAULT_EPSILON;
+    return Config;
+}
+
+static inline HMM_Bool _HMM_NormalMatrixFinite(float Value)
+{
+    return (HMM_Bool)(Value == Value && Value <= HMM_NORMAL_MATRIX_MAX_VALUE && Value >= -HMM_NORMAL_MATRIX_MAX_VALUE);
+}
+
+static inline HMM_Mat3 _HMM_NormalMatrixLinearPart(HMM_Mat4 Transform)
+{
+    HMM_Mat3 Result = {0};
+    int Column, Row;
+
+    for (Column = 0; Column < 3; ++Column)
+    {
+        for (Row = 0; Row < 3; ++Row)
+        {
+            Result.Elements[Column][Row] = Transform.Elements[Column][Row];
+        }
+    }
+
+    return Result;
+}
+
+static inline HMM_Bool _HMM_NormalMatrixMat3Finite(HMM_Mat3 Matrix)
+{
+    int Column, Row;
+
+    for (Column = 0; Column < 3; ++Column)
+    {
+        for (Row = 0; Row < 3; ++Row)
+        {
+            if (!_HMM_NormalMatrixFinite(Matrix.Elements[Column][Row]))
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+static inline HMM_Vec3 _HMM_NormalMatrixSafeNormV3(HMM_Vec3 Vector)
+{
+    HMM_Vec3 Result = Vector;
+    float MaxComponent = HMM_MAX(HMM_ABS(Vector.X), HMM_MAX(HMM_ABS(Vector.Y), HMM_ABS(Vector.Z)));
+
+    if (!(MaxComponent > 0.0f) || !_HMM_NormalMatrixFinite(MaxComponent))
+    {
+        return HMM_V3(0.0f, 0.0f, 0.0f);
+    }
+
+    /* Divide by the largest component first so the squared length cannot
+       overflow or underflow before the normalization. */
+    Result = HMM_DivV3F(Result, MaxComponent);
+
+    float LengthSquared = HMM_DotV3(Result, Result);
+    if (!(LengthSquared > 0.0f) || !_HMM_NormalMatrixFinite(LengthSquared))
+    {
+        return HMM_V3(0.0f, 0.0f, 0.0f);
+    }
+
+    Result = HMM_MulV3F(Result, HMM_InvSqrtF(LengthSquared));
+
+    if (!_HMM_NormalMatrixFinite(Result.X) || !_HMM_NormalMatrixFinite(Result.Y) || !_HMM_NormalMatrixFinite(Result.Z))
+    {
+        return HMM_V3(0.0f, 0.0f, 0.0f);
+    }
+
+    return Result;
+}
+
+static inline HMM_Mat3 _HMM_NormalMatrixClampFinite(HMM_Mat3 Matrix, HMM_Bool *Clipped)
+{
+    HMM_Mat3 Result = Matrix;
+    int Column, Row;
+
+    if (Clipped)
+    {
+        *Clipped = 0;
+    }
+
+    for (Column = 0; Column < 3; ++Column)
+    {
+        for (Row = 0; Row < 3; ++Row)
+        {
+            float Value = Result.Elements[Column][Row];
+
+            if (!(Value == Value))
+            {
+                Value = 0.0f;
+            }
+            else if (Value > HMM_NORMAL_MATRIX_MAX_VALUE)
+            {
+                Value = HMM_NORMAL_MATRIX_MAX_VALUE;
+            }
+            else if (Value < -HMM_NORMAL_MATRIX_MAX_VALUE)
+            {
+                Value = -HMM_NORMAL_MATRIX_MAX_VALUE;
+            }
+
+            if (Value != Result.Elements[Column][Row])
+            {
+                if (Clipped)
+                {
+                    *Clipped = 1;
+                }
+                Result.Elements[Column][Row] = Value;
+            }
+        }
+    }
+
+    return Result;
+}
+
+// Returns the normal matrix (inverse transpose of the upper-left 3x3) of the
+// given transform. Degenerate transforms are regularized and flagged through
+// OutStatus (which may be NULL). The result is always finite for finite input.
+static inline HMM_Mat3 HMM_NormalMatrixM4(HMM_Mat4 Transform, HMM_NormalMatrixConfig Config, HMM_NormalMatrixStatus *OutStatus)
+{
+    HMM_Mat3 Linear = _HMM_NormalMatrixLinearPart(Transform);
+    HMM_Mat3 Normalized;
+    HMM_Mat3 Result;
+    HMM_NormalMatrixStatus Status = HMM_NormalMatrixStatus_Ok;
+    float Epsilon = Config.DeterminantEpsilon;
+    float Scale = 0.0f;
+    float InvScale;
+    float Determinant;
+    HMM_Bool Clipped;
+    int Column, Row;
+
+    if (OutStatus)
+    {
+        *OutStatus = HMM_NormalMatrixStatus_Ok;
+    }
+
+    if (!(Epsilon > 0.0f) || !_HMM_NormalMatrixFinite(Epsilon))
+    {
+        Epsilon = HMM_NORMAL_MATRIX_DEFAULT_EPSILON;
+    }
+
+    /* Scale-invariant degeneracy test: normalize the linear part so its
+       largest element is 1. The determinant then stays in a well-behaved
+       range no matter how large or small the transform is. */
+    for (Column = 0; Column < 3; ++Column)
+    {
+        for (Row = 0; Row < 3; ++Row)
+        {
+            if (!_HMM_NormalMatrixFinite(Linear.Elements[Column][Row]))
+            {
+                if (OutStatus)
+                {
+                    *OutStatus = HMM_NormalMatrixStatus_Degenerate;
+                }
+                return HMM_M3D(1.0f);
+            }
+            Scale = HMM_MAX(Scale, HMM_ABS(Linear.Elements[Column][Row]));
+        }
+    }
+
+    if (!(Scale > 0.0f) || !_HMM_NormalMatrixFinite(Scale))
+    {
+        /* Fully collapsed (or unusable) linear part: identity is the only
+           finite, direction-preserving approximation left. */
+        if (OutStatus)
+        {
+            *OutStatus = HMM_NormalMatrixStatus_Degenerate;
+        }
+        return HMM_M3D(1.0f);
+    }
+
+    InvScale = 1.0f / Scale;
+    Normalized = HMM_MulM3F(Linear, InvScale);
+
+    Determinant = HMM_DeterminantM3(Normalized);
+
+    if (_HMM_NormalMatrixFinite(Determinant) && (HMM_ABS(Determinant) > Epsilon))
+    {
+        Result = HMM_TransposeM3(HMM_InvGeneralM3(Normalized));
+    }
+    else
+    {
+        /* Degenerate: use the regularized pseudo-inverse normal matrix
+             N = A * (A^T A + lambda^2 I)^-1
+           which equals A^-T for invertible A. Regularizing in the transform's
+           own (domain) space makes the approximation rotation covariant and
+           exact for directions that survive the collapse; collapsed
+           directions are clamped to zero instead of exploding. */
+        HMM_Mat3 Gram = HMM_MulM3(HMM_TransposeM3(Normalized), Normalized);
+        float RegularizedDeterminant;
+
+        Status = HMM_NormalMatrixStatus_Degenerate;
+
+        Gram.Elements[0][0] += Epsilon;
+        Gram.Elements[1][1] += Epsilon;
+        Gram.Elements[2][2] += Epsilon;
+
+        RegularizedDeterminant = HMM_DeterminantM3(Gram);
+
+        if (_HMM_NormalMatrixFinite(RegularizedDeterminant) && (RegularizedDeterminant != 0.0f))
+        {
+            Result = HMM_MulM3(Normalized, HMM_InvGeneralM3(Gram));
+        }
+        else
+        {
+            Result = HMM_M3D(1.0f);
+        }
+    }
+
+    /* Undo the normalization, then force the result finite. A transform whose
+       inverse overflows (e.g. a vanishing uniform scale) is reported as
+       degenerate rather than handed back as an infinity. */
+    Result = HMM_MulM3F(Result, InvScale);
+    Result = _HMM_NormalMatrixClampFinite(Result, &Clipped);
+
+    if (Clipped || !_HMM_NormalMatrixMat3Finite(Result))
+    {
+        Result = _HMM_NormalMatrixClampFinite(Result, 0);
+        Status = HMM_NormalMatrixStatus_Degenerate;
+    }
+
+    if (OutStatus)
+    {
+        *OutStatus = Status;
+    }
+
+    return Result;
+}
+
+// Applies the transform's normal matrix to a normal vector. If Config.Normalize
+// is set, the result is normalized (a zero result stays zero instead of NaN).
+// The output is always finite; a non-finite intermediate is clamped rather
+// than propagated. Degeneracy of the transform itself is still reported.
+static inline HMM_Vec3 HMM_NormalM4(HMM_Vec3 Normal, HMM_Mat4 Transform, HMM_NormalMatrixConfig Config, HMM_NormalMatrixStatus *OutStatus)
+{
+    HMM_NormalMatrixStatus Status;
+    HMM_Mat3 NormalMatrix = HMM_NormalMatrixM4(Transform, Config, &Status);
+    HMM_Vec3 Result = HMM_MulM3V3(NormalMatrix, Normal);
+
+    if (Config.Normalize)
+    {
+        Result = _HMM_NormalMatrixSafeNormV3(Result);
+    }
+    else
+    {
+        Result.X = HMM_Clamp(-HMM_NORMAL_MATRIX_MAX_VALUE, Result.X, HMM_NORMAL_MATRIX_MAX_VALUE);
+        Result.Y = HMM_Clamp(-HMM_NORMAL_MATRIX_MAX_VALUE, Result.Y, HMM_NORMAL_MATRIX_MAX_VALUE);
+        Result.Z = HMM_Clamp(-HMM_NORMAL_MATRIX_MAX_VALUE, Result.Z, HMM_NORMAL_MATRIX_MAX_VALUE);
+
+        /* Clamp above turns a NaN into the min bound; normalize any residue. */
+        if (!_HMM_NormalMatrixFinite(Result.X)) Result.X = 0.0f;
+        if (!_HMM_NormalMatrixFinite(Result.Y)) Result.Y = 0.0f;
+        if (!_HMM_NormalMatrixFinite(Result.Z)) Result.Z = 0.0f;
+    }
+
+    if (OutStatus)
+    {
+        *OutStatus = Status;
+    }
+
+    return Result;
+}
+
+// Computes Count normal matrices in chunks of Config.BatchSize. Returns the
+// number of degenerate transforms detected. OutStatus may be NULL.
+static inline int HMM_NormalMatrixBatchM4(HMM_Mat3 *OutNormalMatrices, const HMM_Mat4 *Transforms, int Count, HMM_NormalMatrixConfig Config, HMM_NormalMatrixStatus *OutStatus)
+{
+    int DegenerateCount = 0;
+    int BatchSize = Config.BatchSize;
+    int Start;
+
+    if (Count <= 0)
+    {
+        return 0;
+    }
+
+    if (BatchSize <= 0 || BatchSize > Count)
+    {
+        BatchSize = Count;
+    }
+
+    for (Start = 0; Start < Count; Start += BatchSize)
+    {
+        int End = Count - Start;
+        int Index;
+
+        if (End > BatchSize)
+        {
+            End = BatchSize;
+        }
+        End += Start;
+
+        for (Index = Start; Index < End; ++Index)
+        {
+            HMM_NormalMatrixStatus ElementStatus;
+            OutNormalMatrices[Index] = HMM_NormalMatrixM4(Transforms[Index], Config, &ElementStatus);
+
+            if (ElementStatus == HMM_NormalMatrixStatus_Degenerate)
+            {
+                ++DegenerateCount;
+            }
+            if (OutStatus)
+            {
+                OutStatus[Index] = ElementStatus;
+            }
+        }
+    }
+
+    return DegenerateCount;
+}
+
+// Applies each transform's normal matrix to the corresponding normal vector in
+// chunks of Config.BatchSize. Returns the number of degenerate transforms.
+static inline int HMM_NormalBatchM4(HMM_Vec3 *OutNormals, const HMM_Vec3 *Normals, const HMM_Mat4 *Transforms, int Count, HMM_NormalMatrixConfig Config, HMM_NormalMatrixStatus *OutStatus)
+{
+    int DegenerateCount = 0;
+    int BatchSize = Config.BatchSize;
+    int Start;
+
+    if (Count <= 0)
+    {
+        return 0;
+    }
+
+    if (BatchSize <= 0 || BatchSize > Count)
+    {
+        BatchSize = Count;
+    }
+
+    for (Start = 0; Start < Count; Start += BatchSize)
+    {
+        int End = Count - Start;
+        int Index;
+
+        if (End > BatchSize)
+        {
+            End = BatchSize;
+        }
+        End += Start;
+
+        for (Index = Start; Index < End; ++Index)
+        {
+            HMM_NormalMatrixStatus ElementStatus;
+            OutNormals[Index] = HMM_NormalM4(Normals[Index], Transforms[Index], Config, &ElementStatus);
+
+            if (ElementStatus == HMM_NormalMatrixStatus_Degenerate)
+            {
+                ++DegenerateCount;
+            }
+            if (OutStatus)
+            {
+                OutStatus[Index] = ElementStatus;
+            }
+        }
+    }
+
+    return DegenerateCount;
+}
+
+/*
  * Common graphics transformations
  */
 
