@@ -2656,6 +2656,434 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * 2D segment closest-point queries with a uniform-grid acceleration
+ * structure, intended for pathfinding-style "distance to nearest wall"
+ * queries against scenes of thousands of wall segments.
+ *
+ * The three stages:
+ *   1. HMM_ClosestPointOnSegment: closest point and distance for one
+ *      segment (zero-length segments are treated as points).
+ *   2. HMM_SegmentGridBufferSize + HMM_SegmentGridInit: build a uniform
+ *      grid over many segments. The caller supplies all memory (an int
+ *      buffer); the library never allocates. The grid granularity is
+ *      configured through CellSize.
+ *   3. HMM_SegmentGridQuery / HMM_SegmentGridQueryBatch: closest
+ *      segment, point and distance for one query point or a batch.
+ *      The batch size is simply the Count parameter.
+ * HMM_ClosestPointBruteForce is the reference implementation; the grid
+ * returns bit-identical results (same tie-break: lowest segment index
+ * wins an exact distance tie).
+ */
+
+typedef struct HMM_Segment2D
+{
+    HMM_Vec2 A;
+    HMM_Vec2 B;
+} HMM_Segment2D;
+
+typedef struct HMM_ClosestPoint2D
+{
+    HMM_Vec2 Point;
+    float Distance;   /* -1 when there were no segments to query */
+    int SegmentIndex; /* -1 when there were no segments to query */
+} HMM_ClosestPoint2D;
+
+typedef struct HMM_SegmentGrid
+{
+    int Width;
+    int Height;
+    int NumSegments;
+    int NumItems;
+    float CellSize;
+    float InvCellSize;
+    float MinX;
+    float MinY;
+    const HMM_Segment2D *Segments;
+    int *CellOffsets;        /* Width*Height + 1 entries, into CellItems */
+    int *CellItems;          /* NumItems segment indices */
+    unsigned int *Stamps;    /* NumSegments per-query dedup stamps */
+    unsigned int QueryStamp;
+} HMM_SegmentGrid;
+
+/* Internal helpers, not part of the public API. */
+
+static inline int HMM_SegGridFloorToInt(float F)
+{
+    int I = (int)F; /* truncation toward zero */
+    if (F < 0.0f && F - (float)I < 0.0f)
+    {
+        --I;
+    }
+    return I;
+}
+
+static inline void HMM_SegGridAxisRange(float Min, float InvCellSize, int CellCount,
+                                        float Lo, float Hi, int *OutLo, int *OutHi)
+{
+    int CLo = HMM_SegGridFloorToInt((Lo - Min) * InvCellSize);
+    int CHi = HMM_SegGridFloorToInt((Hi - Min) * InvCellSize);
+
+    /* Segments sticking out of the grid bounds are registered in the
+       nearest edge cells so that queries can still find them. */
+    CLo = HMM_MIN(HMM_MAX(CLo, 0), CellCount - 1);
+    CHi = HMM_MIN(HMM_MAX(CHi, 0), CellCount - 1);
+
+    *OutLo = CLo;
+    *OutHi = CHi;
+}
+
+static inline int HMM_SegGridItemCount(const HMM_Segment2D *Segments, int NumSegments,
+                                       float MinX, float MinY, float InvCellSize,
+                                       int Width, int Height)
+{
+    long long Total = 0;
+    int I;
+
+    for (I = 0; I < NumSegments; ++I)
+    {
+        int X0, X1, Y0, Y1;
+        float LoX = HMM_MIN(Segments[I].A.X, Segments[I].B.X);
+        float HiX = HMM_MAX(Segments[I].A.X, Segments[I].B.X);
+        float LoY = HMM_MIN(Segments[I].A.Y, Segments[I].B.Y);
+        float HiY = HMM_MAX(Segments[I].A.Y, Segments[I].B.Y);
+
+        HMM_SegGridAxisRange(MinX, InvCellSize, Width, LoX, HiX, &X0, &X1);
+        HMM_SegGridAxisRange(MinY, InvCellSize, Height, LoY, HiY, &Y0, &Y1);
+
+        Total += (long long)(X1 - X0 + 1) * (long long)(Y1 - Y0 + 1);
+        if (Total > 0x7FFFFF00LL)
+        {
+            return -1; /* overflow guard */
+        }
+    }
+
+    return (int)Total;
+}
+
+static inline HMM_ClosestPoint2D HMM_ClosestPointOnSegment(HMM_Vec2 P, HMM_Segment2D Segment)
+{
+    HMM_ClosestPoint2D Result;
+    HMM_Vec2 AB = HMM_SubV2(Segment.B, Segment.A);
+    float LenSqr = HMM_LenSqrV2(AB);
+
+    if (LenSqr > 0.0f)
+    {
+        float T = HMM_Clamp(0.0f, HMM_DotV2(HMM_SubV2(P, Segment.A), AB) / LenSqr, 1.0f);
+        Result.Point = HMM_AddV2(Segment.A, HMM_MulV2F(AB, T));
+    }
+    else
+    {
+        /* Zero-length segment: treat it as a point. */
+        Result.Point = Segment.A;
+    }
+
+    Result.Distance = HMM_LenV2(HMM_SubV2(P, Result.Point));
+    Result.SegmentIndex = 0;
+
+    return Result;
+}
+
+static inline HMM_ClosestPoint2D HMM_ClosestPointBruteForce(HMM_Vec2 P,
+                                                            const HMM_Segment2D *Segments,
+                                                            int NumSegments)
+{
+    HMM_ClosestPoint2D Best;
+    float BestSqr = -1.0f;
+    int I;
+
+    Best.Point = P;
+    Best.Distance = -1.0f;
+    Best.SegmentIndex = -1;
+
+    for (I = 0; I < NumSegments; ++I)
+    {
+        HMM_Vec2 Point = HMM_ClosestPointOnSegment(P, Segments[I]).Point;
+        float DSqr = HMM_LenSqrV2(HMM_SubV2(P, Point));
+
+        if (BestSqr < 0.0f || DSqr < BestSqr || (DSqr <= BestSqr && I < Best.SegmentIndex))
+        {
+            BestSqr = DSqr;
+            Best.SegmentIndex = I;
+            Best.Point = Point;
+        }
+    }
+
+    if (BestSqr >= 0.0f)
+    {
+        Best.Distance = HMM_SqrtF(BestSqr);
+    }
+
+    return Best;
+}
+
+/* Number of ints the caller must provide to HMM_SegmentGridInit.
+   Returns 0 when the arguments are invalid. */
+static inline int HMM_SegmentGridBufferSize(const HMM_Segment2D *Segments, int NumSegments,
+                                            float MinX, float MinY, float MaxX, float MaxY,
+                                            float CellSize)
+{
+    int Width, Height, Items;
+    float InvCellSize;
+    long long Total;
+
+    if (NumSegments < 0 || (NumSegments > 0 && Segments == 0) ||
+        !(CellSize > 0.0f) || !(MaxX > MinX) || !(MaxY > MinY))
+    {
+        return 0;
+    }
+
+    InvCellSize = 1.0f / CellSize;
+    Width = HMM_SegGridFloorToInt((MaxX - MinX) * InvCellSize) + 1;
+    Height = HMM_SegGridFloorToInt((MaxY - MinY) * InvCellSize) + 1;
+    if (Width <= 0 || Height <= 0 || (long long)Width * (long long)Height > 0x3FFFFFFFLL)
+    {
+        return 0;
+    }
+
+    Items = HMM_SegGridItemCount(Segments, NumSegments, MinX, MinY, InvCellSize, Width, Height);
+    if (Items < 0)
+    {
+        return 0;
+    }
+
+    Total = (long long)Width * (long long)Height + 1 + (long long)Items + (long long)NumSegments;
+    if (Total > 0x7FFFFFF0LL)
+    {
+        return 0;
+    }
+
+    return (int)Total;
+}
+
+/* Builds the grid into Buffer (BufferInts ints, see HMM_SegmentGridBufferSize).
+   Returns 1 on success, 0 on invalid arguments or a too-small buffer.
+   The Segments array and the buffer must outlive the grid. */
+static inline int HMM_SegmentGridInit(HMM_SegmentGrid *Grid,
+                                      const HMM_Segment2D *Segments, int NumSegments,
+                                      float MinX, float MinY, float MaxX, float MaxY,
+                                      float CellSize, void *Buffer, int BufferInts)
+{
+    int Needed, Width, Height, Items, CellCount, I, C, Running;
+    float InvCellSize;
+
+    if (Grid == 0 || Buffer == 0)
+    {
+        return 0;
+    }
+
+    Needed = HMM_SegmentGridBufferSize(Segments, NumSegments, MinX, MinY, MaxX, MaxY, CellSize);
+    if (Needed <= 0 || BufferInts < Needed)
+    {
+        return 0;
+    }
+
+    InvCellSize = 1.0f / CellSize;
+    Width = HMM_SegGridFloorToInt((MaxX - MinX) * InvCellSize) + 1;
+    Height = HMM_SegGridFloorToInt((MaxY - MinY) * InvCellSize) + 1;
+    Items = HMM_SegGridItemCount(Segments, NumSegments, MinX, MinY, InvCellSize, Width, Height);
+    CellCount = Width * Height;
+
+    Grid->Width = Width;
+    Grid->Height = Height;
+    Grid->NumSegments = NumSegments;
+    Grid->NumItems = Items;
+    Grid->CellSize = CellSize;
+    Grid->InvCellSize = InvCellSize;
+    Grid->MinX = MinX;
+    Grid->MinY = MinY;
+    Grid->Segments = Segments;
+    Grid->CellOffsets = (int *)Buffer;
+    Grid->CellItems = Grid->CellOffsets + (CellCount + 1);
+    Grid->Stamps = (unsigned int *)(Grid->CellItems + Items);
+    Grid->QueryStamp = 0;
+
+    for (I = 0; I < CellCount + 1; ++I)
+    {
+        Grid->CellOffsets[I] = 0;
+    }
+    for (I = 0; I < NumSegments; ++I)
+    {
+        Grid->Stamps[I] = 0;
+    }
+
+    /* Pass 1: count the segments overlapping each cell. */
+    for (I = 0; I < NumSegments; ++I)
+    {
+        int X0, X1, Y0, Y1, X, Y;
+        float LoX = HMM_MIN(Segments[I].A.X, Segments[I].B.X);
+        float HiX = HMM_MAX(Segments[I].A.X, Segments[I].B.X);
+        float LoY = HMM_MIN(Segments[I].A.Y, Segments[I].B.Y);
+        float HiY = HMM_MAX(Segments[I].A.Y, Segments[I].B.Y);
+
+        HMM_SegGridAxisRange(MinX, InvCellSize, Width, LoX, HiX, &X0, &X1);
+        HMM_SegGridAxisRange(MinY, InvCellSize, Height, LoY, HiY, &Y0, &Y1);
+
+        for (Y = Y0; Y <= Y1; ++Y)
+        {
+            for (X = X0; X <= X1; ++X)
+            {
+                ++Grid->CellOffsets[Y * Width + X];
+            }
+        }
+    }
+
+    /* Turn the counts into end-offsets. */
+    Running = 0;
+    for (C = 0; C < CellCount; ++C)
+    {
+        Running += Grid->CellOffsets[C];
+        Grid->CellOffsets[C] = Running;
+    }
+
+    /* Pass 2: fill backwards from the end-offsets. Afterwards
+       CellOffsets[C] holds the start of cell C, which is exactly the
+       layout queries want; only the final total has to be appended. */
+    for (I = 0; I < NumSegments; ++I)
+    {
+        int X0, X1, Y0, Y1, X, Y;
+        float LoX = HMM_MIN(Segments[I].A.X, Segments[I].B.X);
+        float HiX = HMM_MAX(Segments[I].A.X, Segments[I].B.X);
+        float LoY = HMM_MIN(Segments[I].A.Y, Segments[I].B.Y);
+        float HiY = HMM_MAX(Segments[I].A.Y, Segments[I].B.Y);
+
+        HMM_SegGridAxisRange(MinX, InvCellSize, Width, LoX, HiX, &X0, &X1);
+        HMM_SegGridAxisRange(MinY, InvCellSize, Height, LoY, HiY, &Y0, &Y1);
+
+        for (Y = Y0; Y <= Y1; ++Y)
+        {
+            for (X = X0; X <= X1; ++X)
+            {
+                Grid->CellItems[--Grid->CellOffsets[Y * Width + X]] = I;
+            }
+        }
+    }
+    Grid->CellOffsets[CellCount] = Items;
+
+    return 1;
+}
+
+static inline void HMM_SegGridVisitCell(HMM_SegmentGrid *Grid, int CellIndex, HMM_Vec2 P,
+                                        float *BestSqr, int *BestIndex, HMM_Vec2 *BestPoint)
+{
+    int Start = Grid->CellOffsets[CellIndex];
+    int End = Grid->CellOffsets[CellIndex + 1];
+    int I;
+
+    for (I = Start; I < End; ++I)
+    {
+        int SegIndex = Grid->CellItems[I];
+
+        if (Grid->Stamps[SegIndex] != Grid->QueryStamp)
+        {
+            HMM_Vec2 Point;
+            float DSqr;
+
+            Grid->Stamps[SegIndex] = Grid->QueryStamp;
+            Point = HMM_ClosestPointOnSegment(P, Grid->Segments[SegIndex]).Point;
+            DSqr = HMM_LenSqrV2(HMM_SubV2(P, Point));
+
+            if (*BestSqr < 0.0f || DSqr < *BestSqr || (DSqr <= *BestSqr && SegIndex < *BestIndex))
+            {
+                *BestSqr = DSqr;
+                *BestIndex = SegIndex;
+                *BestPoint = Point;
+            }
+        }
+    }
+}
+
+static inline HMM_ClosestPoint2D HMM_SegmentGridQuery(HMM_SegmentGrid *Grid, HMM_Vec2 P)
+{
+    HMM_ClosestPoint2D Best;
+    float BestSqr = -1.0f;
+    int CX, CY, K, KMax;
+
+    Best.Point = P;
+    Best.Distance = -1.0f;
+    Best.SegmentIndex = -1;
+
+    if (Grid == 0 || Grid->NumSegments <= 0)
+    {
+        return Best;
+    }
+
+    ++Grid->QueryStamp;
+    if (Grid->QueryStamp == 0)
+    {
+        /* Wrapped around: reset the stamps so no segment is skipped. */
+        int I;
+        for (I = 0; I < Grid->NumSegments; ++I)
+        {
+            Grid->Stamps[I] = 0;
+        }
+        Grid->QueryStamp = 1;
+    }
+
+    CX = HMM_SegGridFloorToInt((P.X - Grid->MinX) * Grid->InvCellSize);
+    CY = HMM_SegGridFloorToInt((P.Y - Grid->MinY) * Grid->InvCellSize);
+    CX = HMM_MIN(HMM_MAX(CX, 0), Grid->Width - 1);
+    CY = HMM_MIN(HMM_MAX(CY, 0), Grid->Height - 1);
+
+    KMax = HMM_MAX(HMM_MAX(CX, Grid->Width - 1 - CX),
+                   HMM_MAX(CY, Grid->Height - 1 - CY));
+
+    /* Expanding-square (Chebyshev ring) search. After ring K has been
+       visited, every unvisited cell is at least K*CellSize away from P,
+       so the search can stop once the best distance is within that. */
+    for (K = 0; K <= KMax; ++K)
+    {
+        int X0 = HMM_MAX(CX - K, 0);
+        int X1 = HMM_MIN(CX + K, Grid->Width - 1);
+        int Y0 = HMM_MAX(CY - K, 0);
+        int Y1 = HMM_MIN(CY + K, Grid->Height - 1);
+        int X, Y;
+
+        for (X = X0; X <= X1; ++X)
+        {
+            HMM_SegGridVisitCell(Grid, Y0 * Grid->Width + X, P, &BestSqr, &Best.SegmentIndex, &Best.Point);
+            if (Y1 > Y0)
+            {
+                HMM_SegGridVisitCell(Grid, Y1 * Grid->Width + X, P, &BestSqr, &Best.SegmentIndex, &Best.Point);
+            }
+        }
+        for (Y = Y0 + 1; Y < Y1; ++Y)
+        {
+            HMM_SegGridVisitCell(Grid, Y * Grid->Width + X0, P, &BestSqr, &Best.SegmentIndex, &Best.Point);
+            if (X1 > X0)
+            {
+                HMM_SegGridVisitCell(Grid, Y * Grid->Width + X1, P, &BestSqr, &Best.SegmentIndex, &Best.Point);
+            }
+        }
+
+        if (BestSqr >= 0.0f)
+        {
+            float Limit = (float)K * Grid->CellSize;
+            if (BestSqr <= Limit * Limit)
+            {
+                break;
+            }
+        }
+    }
+
+    if (BestSqr >= 0.0f)
+    {
+        Best.Distance = HMM_SqrtF(BestSqr);
+    }
+
+    return Best;
+}
+
+static inline void HMM_SegmentGridQueryBatch(HMM_SegmentGrid *Grid, const HMM_Vec2 *Points,
+                                             HMM_ClosestPoint2D *Results, int Count)
+{
+    int I;
+    for (I = 0; I < Count; ++I)
+    {
+        Results[I] = HMM_SegmentGridQuery(Grid, Points[I]);
+    }
+}
+
 
 #ifdef __cplusplus
 }
