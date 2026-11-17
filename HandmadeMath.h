@@ -3937,4 +3937,1017 @@ void __hmm_invalid_generic(void);
 #pragma GCC diagnostic pop
 #endif
 
+/*
+  =============================================================================
+  HSH - Handmade Spatial Hash (broad-phase collision)
+
+  A uniform-grid spatial hash for the broad phase of collision detection,
+  implemented as flat arrays so that per-frame work allocates nothing.
+
+  Three pieces, as described in the design brief:
+
+    1. Build.  Space is divided into square cells of side cell_size. Each
+               object occupies every cell its axis-aligned bounding box
+               overlaps; cells are stored in an open-addressed-free-list
+               hash table keyed on the cell coordinates.
+
+    2. Update. When an object moves, only the cells it left and the cells it
+               entered are touched. HSH_UPDATE_INCREMENTAL maintains the hash
+               in place; HSH_UPDATE_REBUILD tears it down and re-inserts every
+               object each frame.
+
+    3. Query.  Candidate pairs are produced by comparing each object only
+               against the objects in its own cell and in every cell within
+               neighborhood cells in each direction. The result contains
+               every truly overlapping pair (no false negatives); any extra
+               pairs are false positives the narrow phase can reject.
+
+  All storage is allocated once by HSH_Init and freed by HSH_Free. Because no
+  operation grows the tables, the memory footprint is independent of the
+  number of frames run: it depends only on the configured maximum object
+  count and the maximum number of cells a single object may cover.
+
+  Status codes starting at 1000 are configuration/validation errors.
+
+  This section only adds new HSH_ declarations. It does not modify any of the
+  HMM_ declarations above it.
+  =============================================================================
+*/
+
+#include <stdlib.h>
+#include <float.h>
+
+/* Result codes. HSH_OK is zero; every failure code is non-zero and distinct. */
+typedef enum HSH_Result
+{
+    HSH_OK = 0,
+    HSH_ERROR_INVALID_CELL_SIZE = 1000, /* <= 0, NaN or infinite cell size */
+    HSH_ERROR_INVALID_NEIGHBORHOOD,     /* negative neighborhood radius */
+    HSH_ERROR_INVALID_BUCKET_COUNT,     /* zero bucket count */
+    HSH_ERROR_INVALID_MAX_OBJECTS,      /* zero max object count */
+    HSH_ERROR_INVALID_MAX_SPAN,         /* zero max cell span */
+    HSH_ERROR_INVALID_STRATEGY,         /* update strategy not in the enum */
+    HSH_ERROR_FULL,                     /* object/table capacity exhausted */
+    HSH_ERROR_SPAN_TOO_LARGE,           /* object covers too many cells */
+    HSH_ERROR_PAIR_CAPACITY,            /* query output array too small */
+    HSH_ERROR_OUT_OF_MEMORY, /* allocation failure */
+    HSH_ERROR_INVALID_ARGUMENT /* NULL pointer or bad object geometry */
+} HSH_Result;
+
+/* Per-frame update strategy. */
+typedef enum HSH_UpdateStrategy
+{
+    /* Move only the cell memberships of objects that changed cells. */
+    HSH_UPDATE_INCREMENTAL = 0,
+    /* Clear every cell and re-insert all objects from scratch. */
+    HSH_UPDATE_REBUILD = 1
+} HSH_UpdateStrategy;
+
+/*
+  Configuration for HSH_Init.
+
+  cell_size       Side length of one grid cell. Must be finite and > 0.
+  neighborhood    Radius, in cells, searched around every cell. 0 means only
+                  the home cell; 1 means the 3x3 block around it, and so on.
+  bucket_count    Number of hash buckets (the table modulus). Must be > 0.
+                  A prime near the expected live cell count works well.
+  max_objects     Maximum number of simultaneously inserted objects.
+  max_cell_span   Maximum number of cells an object's AABB may cover along
+                  one axis. Objects exceeding this are rejected on insert.
+  strategy        INCREMENTAL (local updates) or REBUILD (full re-hash).
+*/
+typedef struct HSH_Config
+{
+    float cell_size;
+    int neighborhood;
+    int bucket_count;
+    int max_objects;
+    int max_cell_span;
+    HSH_UpdateStrategy strategy;
+} HSH_Config;
+
+/* A candidate object pair: two object indices, always with a < b. */
+typedef struct HSH_Pair
+{
+    int a;
+    int b;
+} HSH_Pair;
+
+/* Live counters, useful for tests and benchmarks. All sizes are element counts. */
+typedef struct HSH_Stats
+{
+    int object_count;     /* objects currently inserted */
+    int cell_count;       /* non-empty cells currently in the table */
+    int entry_count;      /* live object-to-cell memberships */
+    int bucket_count;     /* configured bucket count */
+    int max_chain;        /* longest cell hash chain currently present */
+    int moved_objects;    /* objects that changed cells on the last update */
+    int touched_cells;   /* cell add/remove operations on the last update */
+    size_t total_bytes;   /* bytes owned by the hash (high-water mark) */
+} HSH_Stats;
+
+/* Opaque hash type. All fields are private; use the HSH_ functions. */
+typedef struct HSH_Grid HSH_Grid;
+
+/* Fill in a usable default configuration for the given object capacity. */
+static inline HSH_Config HSH_DefaultConfig(int max_objects)
+{
+    HSH_Config cfg;
+    cfg.cell_size = 10.0f;
+    cfg.neighborhood = 1;
+    cfg.bucket_count = 4099;
+    cfg.max_objects = max_objects;
+    cfg.max_cell_span = 16;
+    cfg.strategy = HSH_UPDATE_INCREMENTAL;
+    return cfg;
+}
+
+/* Validate a configuration without allocating anything. Returns HSH_OK or
+   the specific HSH_ERROR_* code for the first invalid field. */
+static inline HSH_Result HSH_ValidateConfig(const HSH_Config *cfg);
+
+/* Allocate the grid described by cfg. *grid is set to NULL on failure. */
+static inline HSH_Result HSH_Init(HSH_Grid **grid, const HSH_Config *cfg);
+
+/* Free all storage owned by the grid and set *grid to NULL. NULL is allowed. */
+static inline void HSH_Free(HSH_Grid **grid);
+
+/*
+  Insert object index id (0 .. max_objects-1) whose bounding circle has center
+  (x, y) and radius r (use r = 0 for point objects). The occupied cell range
+  is remembered so later moves can be made incrementally.
+*/
+static inline HSH_Result HSH_Insert(HSH_Grid *grid, int id,
+                                    float x, float y, float r);
+
+/*
+  Prepare for a new frame of moves: zero the per-frame counters
+  moved_objects and touched_cells. Call once before the frame's HSH_Move
+  calls. Querying does not require this.
+*/
+static inline void HSH_BeginFrame(HSH_Grid *grid);
+
+/*
+  Move an inserted object to a new center (and optionally a new radius).
+  With the incremental strategy only the old and new cell ranges are
+  touched; with the rebuild strategy this only records the new position and
+  the table is rebuilt on the next HSH_Rebuild call.
+*/
+static inline HSH_Result HSH_Move(HSH_Grid *grid, int id,
+                                  float x, float y, float r);
+
+/*
+  Explicitly rebuild every cell from the recorded positions. A no-op (other
+  than clearing counters) for the incremental strategy, which never needs it.
+*/
+static inline HSH_Result HSH_Rebuild(HSH_Grid *grid);
+
+/*
+  Produce candidate pairs. Each object is compared against every object in
+  its own cell and in cells within the configured neighborhood. Every pair
+  appears at most once with a < b.
+
+  out:      caller-owned array of HSH_Pair.
+  capacity: number of elements out can hold.
+  out_count: receives the number of pairs written (or required, when the
+             return code is HSH_ERROR_PAIR_CAPACITY).
+*/
+static inline HSH_Result HSH_QueryPairs(HSH_Grid *g,
+                                        HSH_Pair *out, int capacity,
+                                        int *out_count);
+
+/* Fill *stats with the current counters. */
+static inline void HSH_GetStats(const HSH_Grid *grid, HSH_Stats *stats);
+
+/* Drop every object and every cell without freeing the backing storage. */
+static inline void HSH_Reset(HSH_Grid *grid);
+
+/* ------------------------------------------------------------------------- */
+/* Internal implementation. Everything below is private to this header.      */
+/* ------------------------------------------------------------------------- */
+
+typedef struct HSH_Cell
+{
+    int key;          /* packed cell coordinates, identifies the cell */
+    int cx, cy;       /* unpacked cell coordinates */
+    int head;         /* first entry index, or -1 */
+    int next_cell;    /* next cell in the bucket chain, or -1 */
+} HSH_Cell;
+
+typedef struct HSH_Entry
+{
+    int object;       /* object index owning this membership */
+    int next_entry;   /* next membership in the same cell, or -1 */
+} HSH_Entry;
+
+typedef struct HSH_ObjectRec
+{
+    float x, y, r;
+    int min_cx, min_cy, max_cx, max_cy; /* occupied inclusive cell range */
+    int used;                           /* 1 while inserted, else 0 */
+} HSH_ObjectRec;
+
+struct HSH_Grid
+{
+    HSH_Config cfg;
+    int *buckets;        /* bucket_count heads into the cell chain */
+    int *cell_free;      /* free list of cell slots, -1 terminated */
+    HSH_Cell *cells;     /* cell pool */
+    HSH_Entry *entries;  /* membership pool */
+    int *entry_free;     /* free list of entry slots, -1 terminated */
+    HSH_ObjectRec *objs; /* per-object records */
+    int *emit_stamps;    /* per-source dedup of the second member */
+    int stamp;           /* current query/source stamp */
+    int cell_live;
+    int entry_live;
+    int cell_cap;
+    int entry_cap;
+    int moved_objects;
+    int touched_cells;
+    size_t total_bytes;
+};
+
+static inline int HSH_FiniteF(float v)
+{
+    /* NaN fails both ordered comparisons; +/-inf fails one of them. Using
+       only relational operators keeps this clean under -Wfloat-equal. */
+    return (v <= FLT_MAX) && (v >= -FLT_MAX);
+}
+
+static inline int HSH_PackKey(int cx, int cy)
+{
+    /* Map coordinates to non-negative 16-bit lanes, then mix the lanes.
+       Cells are expected to stay well inside 16-bit ranges. */
+    unsigned int ux = (unsigned int)(cx + 32768);
+    unsigned int uy = (unsigned int)(cy + 32768);
+    return (int)(((ux & 0xFFFFu) << 16) | (uy & 0xFFFFu));
+}
+
+static inline unsigned int HSH_HashKey(int key, int bucket_count)
+{
+    unsigned int h = (unsigned int)key;
+    h ^= h >> 16;
+    h *= 2654435761u;
+    h ^= h >> 13;
+    h *= 2246822519u;
+    h ^= h >> 16;
+    return h % (unsigned int)bucket_count;
+}
+
+static inline HSH_Result HSH_ValidateConfig(const HSH_Config *cfg)
+{
+    if (cfg == NULL)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    if (!HSH_FiniteF(cfg->cell_size) || cfg->cell_size <= 0.0f)
+    {
+        return HSH_ERROR_INVALID_CELL_SIZE;
+    }
+    if (cfg->neighborhood < 0)
+    {
+        return HSH_ERROR_INVALID_NEIGHBORHOOD;
+    }
+    if (cfg->bucket_count <= 0)
+    {
+        return HSH_ERROR_INVALID_BUCKET_COUNT;
+    }
+    if (cfg->max_objects <= 0)
+    {
+        return HSH_ERROR_INVALID_MAX_OBJECTS;
+    }
+    if (cfg->max_cell_span <= 0)
+    {
+        return HSH_ERROR_INVALID_MAX_SPAN;
+    }
+    if (cfg->strategy != HSH_UPDATE_INCREMENTAL &&
+        cfg->strategy != HSH_UPDATE_REBUILD)
+    {
+        return HSH_ERROR_INVALID_STRATEGY;
+    }
+    return HSH_OK;
+}
+
+static inline HSH_Cell *HSH_FindCell(const HSH_Grid *g, int key,
+                                     unsigned int bucket)
+{
+    int ci = g->buckets[bucket];
+    while (ci >= 0)
+    {
+        HSH_Cell *c = &g->cells[ci];
+        if (c->key == key)
+        {
+            return c;
+        }
+        ci = c->next_cell;
+    }
+    return NULL;
+}
+
+/* Find the cell or create it. Returns the cell slot, or -1 when the cell
+   pool is exhausted. */
+static inline int HSH_AcquireCell(HSH_Grid *g, int key, int cx, int cy)
+{
+    unsigned int bucket = HSH_HashKey(key, g->cfg.bucket_count);
+    int ci = g->buckets[bucket];
+    while (ci >= 0)
+    {
+        if (g->cells[ci].key == key)
+        {
+            return ci;
+        }
+        ci = g->cells[ci].next_cell;
+    }
+
+    ci = g->cell_free[0];
+    if (ci < 0)
+    {
+        return -1;
+    }
+    g->cell_free[0] = g->cells[ci].next_cell;
+
+    g->cells[ci].key = key;
+    g->cells[ci].cx = cx;
+    g->cells[ci].cy = cy;
+    g->cells[ci].head = -1;
+    g->cells[ci].next_cell = g->buckets[bucket];
+    g->buckets[bucket] = ci;
+    g->cell_live += 1;
+    return ci;
+}
+
+/* Add an object membership to the cell at slot ci. Returns HSH_OK or
+   HSH_ERROR_FULL when the entry pool is exhausted. */
+static inline HSH_Result HSH_AddEntry(HSH_Grid *g, int ci, int object)
+{
+    int ei = g->entry_free[0];
+    if (ei < 0)
+    {
+        return HSH_ERROR_FULL;
+    }
+    g->entry_free[0] = g->entries[ei].next_entry;
+
+    g->entries[ei].object = object;
+    g->entries[ei].next_entry = g->cells[ci].head;
+    g->cells[ci].head = ei;
+    g->entry_live += 1;
+    return HSH_OK;
+}
+
+/* Remove one object's membership from the cell at slot ci. Frees the cell
+   itself once it becomes empty. */
+static inline void HSH_RemoveObjectFromCell(HSH_Grid *g, int ci, int object)
+{
+    HSH_Cell *c = &g->cells[ci];
+    int *link = &c->head;
+    int ei = c->head;
+    while (ei >= 0)
+    {
+        if (g->entries[ei].object == object)
+        {
+            int dead = ei;
+            *link = g->entries[ei].next_entry;
+            g->entries[dead].next_entry = g->entry_free[0];
+            g->entry_free[0] = dead;
+            g->entry_live -= 1;
+            break;
+        }
+        link = &g->entries[ei].next_entry;
+        ei = g->entries[ei].next_entry;
+    }
+
+    if (c->head < 0)
+    {
+        unsigned int bucket = HSH_HashKey(c->key, g->cfg.bucket_count);
+        int *clink = &g->buckets[bucket];
+        while (*clink != ci)
+        {
+            clink = &g->cells[*clink].next_cell;
+        }
+        *clink = c->next_cell;
+
+        c->next_cell = g->cell_free[0];
+        c->key = 0;
+        g->cell_free[0] = ci;
+        g->cell_live -= 1;
+    }
+}
+
+/* Remove object from every cell in the inclusive rectangle. Cells that do
+   not exist (or no longer contain the object) are skipped. */
+static inline void HSH_RemoveFromRange(HSH_Grid *g, int object,
+                                       int min_cx, int min_cy,
+                                       int max_cx, int max_cy)
+{
+    int cx, cy;
+    for (cy = min_cy; cy <= max_cy; ++cy)
+    {
+        for (cx = min_cx; cx <= max_cx; ++cx)
+        {
+            int key = HSH_PackKey(cx, cy);
+            unsigned int bucket = HSH_HashKey(key, g->cfg.bucket_count);
+            HSH_Cell *c = HSH_FindCell(g, key, bucket);
+            if (c != NULL)
+            {
+                int ci = (int)(c - g->cells);
+                HSH_RemoveObjectFromCell(g, ci, object);
+            }
+        }
+    }
+}
+
+static inline int HSH_FloorF(float v)
+{
+    /* Floor without depending on math.h: truncate toward zero, then subtract
+       one for negative values with a fractional part. NaN-safe inputs are
+       guaranteed by the callers. */
+    int i = (int)v;
+    if (v < 0.0f && (float)i > v)
+    {
+        i -= 1;
+    }
+    return i;
+}
+
+/* Compute the inclusive cell range an AABB covers, rejecting spans that
+   exceed the configured maximum. */
+static inline HSH_Result HSH_RangeOf(const HSH_Grid *g, float x, float y,
+                                     float r, int *out_min_cx,
+                                     int *out_min_cy, int *out_max_cx,
+                                     int *out_max_cy)
+{
+    float inv = 1.0f / g->cfg.cell_size;
+    long span_x;
+    long span_y;
+    int min_cx = HSH_FloorF((x - r) * inv);
+    int max_cx = HSH_FloorF((x + r) * inv);
+    int min_cy = HSH_FloorF((y - r) * inv);
+    int max_cy = HSH_FloorF((y + r) * inv);
+
+    span_x = (long)max_cx - (long)min_cx + 1;
+    span_y = (long)max_cy - (long)min_cy + 1;
+    if (span_x > (long)g->cfg.max_cell_span ||
+        span_y > (long)g->cfg.max_cell_span)
+    {
+        return HSH_ERROR_SPAN_TOO_LARGE;
+    }
+
+    *out_min_cx = min_cx;
+    *out_min_cy = min_cy;
+    *out_max_cx = max_cx;
+    *out_max_cy = max_cy;
+    return HSH_OK;
+}
+
+static inline HSH_Result HSH_Init(HSH_Grid **out_grid, const HSH_Config *cfg)
+{
+    HSH_Grid *g;
+    HSH_Result rc;
+    int i;
+    int cell_cap;
+    int entry_cap;
+    size_t bytes = 0;
+
+    if (out_grid == NULL)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    *out_grid = NULL;
+
+    rc = HSH_ValidateConfig(cfg);
+    if (rc != HSH_OK)
+    {
+        return rc;
+    }
+
+    /* Worst case: every object occupies max_cell_span^2 distinct cells with
+       no sharing. The cell pool and the membership pool then both need
+       max_objects * max_cell_span^2 slots. Everything is bounded by the
+       configuration, so neither pool ever grows after init. */
+    {
+        long span2 = (long)cfg->max_cell_span * (long)cfg->max_cell_span;
+        long cap = (long)cfg->max_objects * span2;
+        if (cap > 0x7FFFFFFFL)
+        {
+            return HSH_ERROR_INVALID_MAX_SPAN;
+        }
+        cell_cap = (int)cap;
+        entry_cap = (int)cap;
+    }
+
+    g = (HSH_Grid *)malloc(sizeof(HSH_Grid));
+    if (g == NULL)
+    {
+        return HSH_ERROR_OUT_OF_MEMORY;
+    }
+    g->cfg = *cfg;
+    g->cell_cap = cell_cap;
+    g->entry_cap = entry_cap;
+    g->cell_live = 0;
+    g->entry_live = 0;
+    g->moved_objects = 0;
+    g->touched_cells = 0;
+    g->stamp = 0;
+    g->buckets = NULL;
+    g->cell_free = NULL;
+    g->cells = NULL;
+    g->entries = NULL;
+    g->entry_free = NULL;
+    g->objs = NULL;
+    g->emit_stamps = NULL;
+
+    g->buckets = (int *)malloc(sizeof(int) * (size_t)cfg->bucket_count);
+    g->cell_free = (int *)malloc(sizeof(int));
+    g->cells = (HSH_Cell *)malloc(sizeof(HSH_Cell) * (size_t)cell_cap);
+    g->entries = (HSH_Entry *)malloc(sizeof(HSH_Entry) * (size_t)entry_cap);
+    g->entry_free = (int *)malloc(sizeof(int));
+    g->objs = (HSH_ObjectRec *)malloc(sizeof(HSH_ObjectRec) *
+                                     (size_t)cfg->max_objects);
+    g->emit_stamps = (int *)malloc(sizeof(int) *
+                                   (size_t)cfg->max_objects);
+
+    if (g->buckets == NULL || g->cell_free == NULL || g->cells == NULL ||
+        g->entries == NULL || g->entry_free == NULL || g->objs == NULL ||
+        g->emit_stamps == NULL)
+    {
+        HSH_Free(&g);
+        return HSH_ERROR_OUT_OF_MEMORY;
+    }
+
+    for (i = 0; i < cfg->bucket_count; ++i)
+    {
+        g->buckets[i] = -1;
+    }
+    for (i = 0; i < cell_cap; ++i)
+    {
+        g->cells[i].key = 0;
+        g->cells[i].cx = 0;
+        g->cells[i].cy = 0;
+        g->cells[i].head = -1;
+        g->cells[i].next_cell = (i + 1 < cell_cap) ? i + 1 : -1;
+    }
+    g->cell_free[0] = (cell_cap > 0) ? 0 : -1;
+
+    for (i = 0; i < entry_cap; ++i)
+    {
+        g->entries[i].object = -1;
+        g->entries[i].next_entry = (i + 1 < entry_cap) ? i + 1 : -1;
+    }
+    g->entry_free[0] = (entry_cap > 0) ? 0 : -1;
+
+    for (i = 0; i < cfg->max_objects; ++i)
+    {
+        g->objs[i].used = 0;
+        g->objs[i].x = 0.0f;
+        g->objs[i].y = 0.0f;
+        g->objs[i].r = 0.0f;
+        g->objs[i].min_cx = 0;
+        g->objs[i].min_cy = 0;
+        g->objs[i].max_cx = 0;
+        g->objs[i].max_cy = 0;
+        g->emit_stamps[i] = 0;
+    }
+
+    bytes = sizeof(HSH_Grid) +
+            sizeof(int) * (size_t)cfg->bucket_count +
+            sizeof(int) +
+            sizeof(HSH_Cell) * (size_t)cell_cap +
+            sizeof(HSH_Entry) * (size_t)entry_cap +
+            sizeof(int) +
+            sizeof(HSH_ObjectRec) * (size_t)cfg->max_objects +
+            sizeof(int) * (size_t)cfg->max_objects;
+    g->total_bytes = bytes;
+
+    *out_grid = g;
+    return HSH_OK;
+}
+
+static inline void HSH_Free(HSH_Grid **grid)
+{
+    if (grid == NULL || *grid == NULL)
+    {
+        return;
+    }
+    free((*grid)->buckets);
+    free((*grid)->cell_free);
+    free((*grid)->cells);
+    free((*grid)->entries);
+    free((*grid)->entry_free);
+    free((*grid)->objs);
+    free((*grid)->emit_stamps);
+    free(*grid);
+    *grid = NULL;
+}
+
+static inline HSH_Result HSH_Insert(HSH_Grid *g, int id,
+                                    float x, float y, float r)
+{
+    HSH_Result rc;
+    int min_cx, min_cy, max_cx, max_cy;
+    int cx, cy;
+
+    if (g == NULL)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    if (id < 0 || id >= g->cfg.max_objects)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    if (g->objs[id].used)
+    {
+        return HSH_ERROR_FULL;
+    }
+    if (!HSH_FiniteF(x) || !HSH_FiniteF(y) || !HSH_FiniteF(r) || r < 0.0f)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+
+    rc = HSH_RangeOf(g, x, y, r, &min_cx, &min_cy, &max_cx, &max_cy);
+    if (rc != HSH_OK)
+    {
+        return rc;
+    }
+
+    /* Add every membership first; if a pool runs out partway through, remove
+       the partial memberships so a failed insert leaves the grid unchanged.
+       Cells the object never reached simply do not exist and are skipped. */
+    for (cy = min_cy; cy <= max_cy; ++cy)
+    {
+        for (cx = min_cx; cx <= max_cx; ++cx)
+        {
+            int key = HSH_PackKey(cx, cy);
+            int ci = HSH_AcquireCell(g, key, cx, cy);
+            if (ci < 0)
+            {
+                HSH_RemoveFromRange(g, id, min_cx, min_cy, max_cx, max_cy);
+                return HSH_ERROR_FULL;
+            }
+            rc = HSH_AddEntry(g, ci, id);
+            if (rc != HSH_OK)
+            {
+                HSH_RemoveFromRange(g, id, min_cx, min_cy, max_cx, max_cy);
+                return rc;
+            }
+        }
+    }
+
+    g->objs[id].used = 1;
+    g->objs[id].x = x;
+    g->objs[id].y = y;
+    g->objs[id].r = r;
+    g->objs[id].min_cx = min_cx;
+    g->objs[id].min_cy = min_cy;
+    g->objs[id].max_cx = max_cx;
+    g->objs[id].max_cy = max_cy;
+    return HSH_OK;
+}
+
+static inline void HSH_ClearCells(HSH_Grid *g)
+{
+    int i;
+    for (i = 0; i < g->cfg.bucket_count; ++i)
+    {
+        g->buckets[i] = -1;
+    }
+    for (i = 0; i < g->cell_cap; ++i)
+    {
+        g->cells[i].head = -1;
+        g->cells[i].next_cell = (i + 1 < g->cell_cap) ? i + 1 : -1;
+        g->cells[i].key = 0;
+    }
+    g->cell_free[0] = (g->cell_cap > 0) ? 0 : -1;
+    g->cell_live = 0;
+
+    for (i = 0; i < g->entry_cap; ++i)
+    {
+        g->entries[i].object = -1;
+        g->entries[i].next_entry = (i + 1 < g->entry_cap) ? i + 1 : -1;
+    }
+    g->entry_free[0] = (g->entry_cap > 0) ? 0 : -1;
+    g->entry_live = 0;
+}
+
+static inline HSH_Result HSH_Rebuild(HSH_Grid *g)
+{
+    int id;
+    if (g == NULL)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    if (g->cfg.strategy != HSH_UPDATE_REBUILD)
+    {
+        g->moved_objects = 0;
+        g->touched_cells = 0;
+        return HSH_OK;
+    }
+
+    HSH_ClearCells(g);
+    for (id = 0; id < g->cfg.max_objects; ++id)
+    {
+        HSH_ObjectRec *o;
+        int cx, cy;
+        if (!g->objs[id].used)
+        {
+            continue;
+        }
+        o = &g->objs[id];
+        for (cy = o->min_cy; cy <= o->max_cy; ++cy)
+        {
+            for (cx = o->min_cx; cx <= o->max_cx; ++cx)
+            {
+                int key = HSH_PackKey(cx, cy);
+                int ci = HSH_AcquireCell(g, key, cx, cy);
+                HSH_Result rc;
+                if (ci < 0)
+                {
+                    return HSH_ERROR_FULL;
+                }
+                rc = HSH_AddEntry(g, ci, id);
+                if (rc != HSH_OK)
+                {
+                    return rc;
+                }
+            }
+        }
+    }
+    return HSH_OK;
+}
+
+static inline void HSH_BeginFrame(HSH_Grid *g)
+{
+    if (g == NULL)
+    {
+        return;
+    }
+    g->moved_objects = 0;
+    g->touched_cells = 0;
+}
+
+static inline HSH_Result HSH_Move(HSH_Grid *g, int id,
+                                  float x, float y, float r)
+{
+    HSH_ObjectRec *o;
+    HSH_Result rc;
+    int old_min_cx, old_min_cy, old_max_cx, old_max_cy;
+    int new_min_cx, new_min_cy, new_max_cx, new_max_cy;
+    int cx, cy;
+
+    if (g == NULL || id < 0 || id >= g->cfg.max_objects || !g->objs[id].used)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+    if (!HSH_FiniteF(x) || !HSH_FiniteF(y) || !HSH_FiniteF(r) || r < 0.0f)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+
+    o = &g->objs[id];
+
+    /* Save the old range before overwriting the record. */
+    old_min_cx = o->min_cx;
+    old_min_cy = o->min_cy;
+    old_max_cx = o->max_cx;
+    old_max_cy = o->max_cy;
+
+    rc = HSH_RangeOf(g, x, y, r, &new_min_cx, &new_min_cy,
+                     &new_max_cx, &new_max_cy);
+    if (rc != HSH_OK)
+    {
+        return rc;
+    }
+
+    /* Record the new geometry. */
+    o->x = x;
+    o->y = y;
+    o->r = r;
+    o->min_cx = new_min_cx;
+    o->min_cy = new_min_cy;
+    o->max_cx = new_max_cx;
+    o->max_cy = new_max_cy;
+
+    if (g->cfg.strategy == HSH_UPDATE_REBUILD)
+    {
+        /* Rebuild happens explicitly; the move only stores the position. */
+        return HSH_OK;
+    }
+
+    if (old_min_cx == new_min_cx && old_min_cy == new_min_cy &&
+        old_max_cx == new_max_cx && old_max_cy == new_max_cy)
+    {
+        /* Same cells: the membership lists need no work at all. */
+        return HSH_OK;
+    }
+
+    g->moved_objects += 1;
+
+    /* Remove the memberships in the old cell range. Cells that become empty
+       are released back to the free list. */
+    for (cy = old_min_cy; cy <= old_max_cy; ++cy)
+    {
+        for (cx = old_min_cx; cx <= old_max_cx; ++cx)
+        {
+            unsigned int bucket;
+            HSH_Cell *c;
+            int key = HSH_PackKey(cx, cy);
+            bucket = HSH_HashKey(key, g->cfg.bucket_count);
+            c = HSH_FindCell(g, key, bucket);
+            if (c != NULL)
+            {
+                int ci = (int)(c - g->cells);
+                HSH_RemoveObjectFromCell(g, ci, id);
+                g->touched_cells += 1;
+            }
+        }
+    }
+
+    /* Add the memberships in the new cell range. */
+    for (cy = new_min_cy; cy <= new_max_cy; ++cy)
+    {
+        for (cx = new_min_cx; cx <= new_max_cx; ++cx)
+        {
+            int key = HSH_PackKey(cx, cy);
+            int ci = HSH_AcquireCell(g, key, cx, cy);
+            if (ci < 0)
+            {
+                return HSH_ERROR_FULL;
+            }
+            rc = HSH_AddEntry(g, ci, id);
+            if (rc != HSH_OK)
+            {
+                return rc;
+            }
+            g->touched_cells += 1;
+        }
+    }
+
+    return HSH_OK;
+}
+
+static inline HSH_Result HSH_QueryPairs(HSH_Grid *g,
+                                        HSH_Pair *out, int capacity,
+                                        int *out_count)
+{
+    int count = 0;
+    int src;
+
+    if (g == NULL || out == NULL || out_count == NULL || capacity < 0)
+    {
+        return HSH_ERROR_INVALID_ARGUMENT;
+    }
+
+    /* One monotonic query counter. For every source object src, emit_stamp
+       marks which second members have already been paired with it. The source
+       iteration must scan every cell src belongs to: skipping further cells
+       of src would miss pairs reachable only through those cells. */
+    g->stamp += 1;
+    if (g->stamp >= 0x7FFFFFFF)
+    {
+        /* About to overflow: reset every stamp so the cycle starts clean. */
+        int i;
+        for (i = 0; i < g->cfg.max_objects; ++i)
+        {
+            g->emit_stamps[i] = 0;
+        }
+        g->stamp = 1;
+    }
+
+    for (src = 0; src < g->cfg.max_objects; ++src)
+    {
+        int emit_stamp;
+        int cx, cy;
+        const HSH_ObjectRec *o;
+
+        if (!g->objs[src].used)
+        {
+            continue;
+        }
+        o = &g->objs[src];
+
+        g->stamp += 1;
+        if (g->stamp >= 0x7FFFFFFF)
+        {
+            int i;
+            for (i = 0; i < g->cfg.max_objects; ++i)
+            {
+                g->emit_stamps[i] = 0;
+            }
+            g->stamp = 1;
+        }
+        emit_stamp = g->stamp;
+
+        /* Every cell the source occupies contributes its own neighborhood. */
+        for (cy = o->min_cy; cy <= o->max_cy; ++cy)
+        {
+            for (cx = o->min_cx; cx <= o->max_cx; ++cx)
+            {
+                int nx, ny;
+                for (ny = cy - g->cfg.neighborhood;
+                     ny <= cy + g->cfg.neighborhood; ++ny)
+                {
+                    for (nx = cx - g->cfg.neighborhood;
+                         nx <= cx + g->cfg.neighborhood; ++nx)
+                    {
+                        unsigned int hb;
+                        HSH_Cell *neighbor;
+                        int key = HSH_PackKey(nx, ny);
+                        int ej;
+                        hb = HSH_HashKey(key, g->cfg.bucket_count);
+                        neighbor = HSH_FindCell(g, key, hb);
+                        if (neighbor == NULL)
+                        {
+                            continue;
+                        }
+
+                        ej = neighbor->head;
+                        while (ej >= 0)
+                        {
+                            int other = g->entries[ej].object;
+                            if (src < other &&
+                                g->emit_stamps[other] != emit_stamp)
+                            {
+                                g->emit_stamps[other] = emit_stamp;
+                                if (count < capacity)
+                                {
+                                    out[count].a = src;
+                                    out[count].b = other;
+                                }
+                                count += 1;
+                            }
+                            ej = g->entries[ej].next_entry;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    *out_count = count;
+    if (count > capacity)
+    {
+        return HSH_ERROR_PAIR_CAPACITY;
+    }
+    return HSH_OK;
+}
+
+static inline void HSH_GetStats(const HSH_Grid *g, HSH_Stats *stats)
+{
+    int b;
+    if (g == NULL || stats == NULL)
+    {
+        return;
+    }
+    stats->object_count = 0;
+    stats->cell_count = g->cell_live;
+    stats->entry_count = g->entry_live;
+    stats->bucket_count = g->cfg.bucket_count;
+    stats->max_chain = 0;
+    stats->moved_objects = g->moved_objects;
+    stats->touched_cells = g->touched_cells;
+    stats->total_bytes = g->total_bytes;
+
+    for (b = 0; b < g->cfg.bucket_count; ++b)
+    {
+        int chain = 0;
+        int ci = g->buckets[b];
+        while (ci >= 0)
+        {
+            chain += 1;
+            ci = g->cells[ci].next_cell;
+        }
+        if (chain > stats->max_chain)
+        {
+            stats->max_chain = chain;
+        }
+    }
+    {
+        int i;
+        for (i = 0; i < g->cfg.max_objects; ++i)
+        {
+            if (g->objs[i].used)
+            {
+                stats->object_count += 1;
+            }
+        }
+    }
+}
+
+static inline void HSH_Reset(HSH_Grid *g)
+{
+    int i;
+    if (g == NULL)
+    {
+        return;
+    }
+    HSH_ClearCells(g);
+    for (i = 0; i < g->cfg.max_objects; ++i)
+    {
+        g->objs[i].used = 0;
+        g->emit_stamps[i] = 0;
+    }
+    g->stamp = 0;
+    g->moved_objects = 0;
+    g->touched_cells = 0;
+}
+
 #endif /* HANDMADE_MATH_H */
