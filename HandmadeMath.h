@@ -61,6 +61,24 @@
     #define HMM_ANGLE_USER_TO_INTERNAL(a) ((a)*HMM_DegToTurn)
     #define HMM_ANGLE_INTERNAL_TO_USER(a) ((a)*HMM_TurnToDeg)
 
+  -----------------------------------------------------------------------------
+
+  HMM_InvGeneralM4Fast is an inverse that recognizes affine matrices (whose
+  last row is 0, 0, 0, 1) and uses a cheaper 3x3-plus-translation path for
+  them, falling back to the general-purpose inverse for everything else. Two
+  knobs configure it:
+
+    #define HANDMADE_MATH_AFFINE_INV 1
+      Enables the affine fast path at compile time. When 0 (the default) the
+      fast path is compiled out, so HMM_InvGeneralM4Fast is bit-for-bit
+      HMM_InvGeneralM4.
+
+    #define HANDMADE_MATH_AFFINE_INV_EPS 1e-6f
+      Absolute tolerance for treating a matrix whose last row is only close
+      to (0, 0, 0, 1) as affine. The strict predicate HMM_IsAffineM4 takes
+      the tolerance explicitly, so behavior is fully controllable at
+      runtime; define this only to change the default.
+
   =============================================================================
 
   LICENSE
@@ -1719,6 +1737,137 @@ static inline HMM_Mat4 HMM_InvGeneralM4(HMM_Mat4 Matrix)
     Result.Columns[3] = HMM_V4V(HMM_SubV3(HMM_Cross(B10, Matrix.Columns[2].XYZ), HMM_MulV3F(C01, Matrix.Columns[2].W)), +HMM_DotV3(Matrix.Columns[2].XYZ, C01));
 
     return HMM_TransposeM4(Result);
+}
+
+/*
+ * Specialized inverse with an affine fast path
+ *
+ * An affine 4x4 matrix has a last row of (0, 0, 0, 1). Its inverse only
+ * needs a 3x3 inverse plus one 3x3/vector multiply instead of the full
+ * general 4x4 machinery. None of the functions below alter
+ * HMM_InvGeneralM4; the general path is always available as a fallback and
+ * is used verbatim for non-affine matrices.
+ */
+
+#ifndef HANDMADE_MATH_AFFINE_INV
+# define HANDMADE_MATH_AFFINE_INV 0
+#endif
+
+#ifndef HANDMADE_MATH_AFFINE_INV_EPS
+# define HANDMADE_MATH_AFFINE_INV_EPS 1e-6f
+#endif
+
+// Returns true when the last row of Matrix is (0, 0, 0, 1) within the given
+// absolute tolerance: |Elements[c][3] - Expected[c]| <= Epsilon for each
+// column c, where Expected is (0, 0, 0, 1). Matrices are column-major, so
+// Elements[c][3] is row 3 of column c -- together the four of them make up
+// the last row. An Epsilon of 0 requests an exact, bitwise comparison.
+// NaN components never compare affine.
+static inline HMM_Bool HMM_IsAffineM4(HMM_Mat4 Matrix, float Epsilon)
+{
+    float const Expected[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    for (int Column = 0; Column < 4; ++Column)
+    {
+        float Difference = Matrix.Elements[Column][3] - Expected[Column];
+        /* NaN is unequal to everything, including itself, so make the
+           "never affine" contract explicit rather than relying on the
+           interval comparisons below (both of which are false for NaN). */
+        if (Difference != Difference)
+        {
+            return 0;
+        }
+        if (Difference < -Epsilon || Epsilon < Difference)
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+// Inverts a matrix known to be affine (last row 0, 0, 0, 1). The linear part
+// is inverted directly with the 3x3 cofactor rule (one determinant, nine
+// products) and the translation is back-transformed; the last row of the
+// result is (0, 0, 0, 1) by construction.
+static inline HMM_Mat4 HMM_InvAffineM4(HMM_Mat4 Matrix)
+{
+    /* Column-major naming: A is the upper-left 3x3 block, where
+       A[row][col] == Matrix.Elements[col][row]. */
+    float A00 = Matrix.Elements[0][0], A01 = Matrix.Elements[1][0], A02 = Matrix.Elements[2][0];
+    float A10 = Matrix.Elements[0][1], A11 = Matrix.Elements[1][1], A12 = Matrix.Elements[2][1];
+    float A20 = Matrix.Elements[0][2], A21 = Matrix.Elements[1][2], A22 = Matrix.Elements[2][2];
+
+    /* Cofactors of A. */
+    float C00 = A11 * A22 - A12 * A21;
+    float C01 = A12 * A20 - A10 * A22;
+    float C02 = A10 * A21 - A11 * A20;
+
+    float Determinant = A00 * C00 + A01 * C01 + A02 * C02;
+    float InvDeterminant = 1.0f / Determinant;
+
+    float C10 = A02 * A21 - A01 * A22;
+    float C11 = A00 * A22 - A02 * A20;
+    float C12 = A01 * A20 - A00 * A21;
+    float C20 = A01 * A12 - A02 * A11;
+    float C21 = A02 * A10 - A00 * A12;
+    float C22 = A00 * A11 - A01 * A10;
+
+    /* InverseLinear[row][col] = cofactor[col][row] / det, i.e. the
+       transposed cofactor matrix scaled by the reciprocal determinant.
+       Written straight into column-major Elements[col][row]. */
+    HMM_Mat4 Result;
+    Result.Elements[0][0] = C00 * InvDeterminant;
+    Result.Elements[1][0] = C10 * InvDeterminant;
+    Result.Elements[2][0] = C20 * InvDeterminant;
+    Result.Elements[0][1] = C01 * InvDeterminant;
+    Result.Elements[1][1] = C11 * InvDeterminant;
+    Result.Elements[2][1] = C21 * InvDeterminant;
+    Result.Elements[0][2] = C02 * InvDeterminant;
+    Result.Elements[1][2] = C12 * InvDeterminant;
+    Result.Elements[2][2] = C22 * InvDeterminant;
+
+    /* Translation is the last column: Elements[3][0..2]. The inverse
+       translation is -InverseLinear * Translation. */
+    float T0 = Matrix.Elements[3][0];
+    float T1 = Matrix.Elements[3][1];
+    float T2 = Matrix.Elements[3][2];
+    Result.Elements[3][0] = -(Result.Elements[0][0] * T0 + Result.Elements[1][0] * T1 + Result.Elements[2][0] * T2);
+    Result.Elements[3][1] = -(Result.Elements[0][1] * T0 + Result.Elements[1][1] * T1 + Result.Elements[2][1] * T2);
+    Result.Elements[3][2] = -(Result.Elements[0][2] * T0 + Result.Elements[1][2] * T1 + Result.Elements[2][2] * T2);
+
+    /* Affine structure: last row (0, 0, 0, 1). */
+    Result.Elements[0][3] = 0.0f;
+    Result.Elements[1][3] = 0.0f;
+    Result.Elements[2][3] = 0.0f;
+    Result.Elements[3][3] = 1.0f;
+
+    return Result;
+}
+
+// General-purpose inverse with an affine fast path.
+//
+// UseFastPath == 0 forces the general implementation, in which case the
+// result is computed by HMM_InvGeneralM4 and is bit-for-bit identical to
+// calling it directly. When HANDMADE_MATH_AFFINE_INV is 0 at compile time
+// the affine code is not even compiled in, so this function is exactly
+// HMM_InvGeneralM4 regardless of UseFastPath.
+//
+// With the fast path enabled, affine matrices (as classified by
+// HMM_IsAffineM4 with the given Epsilon) take HMM_InvAffineM4 and every
+// other matrix falls back to HMM_InvGeneralM4 unchanged.
+static inline HMM_Mat4 HMM_InvGeneralM4Fast(HMM_Mat4 Matrix, HMM_Bool UseFastPath, float Epsilon)
+{
+#if HANDMADE_MATH_AFFINE_INV
+    if (UseFastPath && HMM_IsAffineM4(Matrix, Epsilon))
+    {
+        return HMM_InvAffineM4(Matrix);
+    }
+#else
+    (void)UseFastPath;
+    (void)Epsilon;
+#endif
+
+    return HMM_InvGeneralM4(Matrix);
 }
 
 /*
