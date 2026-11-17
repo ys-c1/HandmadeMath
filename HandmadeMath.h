@@ -2656,6 +2656,396 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+  =============================================================================
+  FRUSTUM CULLING
+
+  A frustum is represented by its six inward-facing planes (normal points into
+  the visible half-space). A point P is inside plane i when
+
+      dot(Normal_i, P) + Dist_i >= 0.
+
+  HMM_FrustumFromVP builds such a frustum from a column-major view-projection
+  matrix; the planes are normalized, so distances are measured in world units.
+
+  Every test returns one of three states:
+    HMM_CULL_INSIDE  - the volume is fully inside every plane,
+    HMM_CULL_OUTSIDE - the volume is fully outside at least one plane,
+    HMM_CULL_INTERSECTS - none of the above.
+
+  A value lying exactly on a plane is treated as inside.
+
+  The HMM_FrustumCull* functions test one volume at a time. The
+  HMM_FrustumCullBatched* functions process arrays of volumes stored in
+  structure-of-arrays (SoA) layout, which keeps every per-plane dot product a
+  contiguous float stream that a vectorizer or hand-written SIMD code can
+  consume directly. Each volume is classified with the exact same arithmetic
+  as the corresponding single-volume function, so the two APIs always agree
+  bit for bit on the same inputs.
+
+  HMM_FrustumCullOptions controls:
+    BatchSize      - number of volumes processed per inner loop chunk
+                     (0 selects HMM_CULL_DEFAULT_BATCH_SIZE)
+    ApproxCapsules - when true, capsules are culled as the bounding sphere
+                     centered on the segment midpoint (one dot product per
+                     plane instead of two). The sphere contains the capsule,
+                     so on every plane its signed-distance interval contains
+                     the exact capsule interval (verified in the tests);
+                     because it reaches farther, an exact INSIDE result may
+                     classify as INTERSECTS under the approximation.
+                     Zero-radius and point (A == B) capsules are identical
+                     in both modes.
+*/
+
+#define HMM_CULL_PLANE_COUNT 6
+#define HMM_CULL_DEFAULT_BATCH_SIZE 256
+
+typedef enum HMM_FrustumCullResult
+{
+    HMM_CULL_INSIDE     = 0,
+    HMM_CULL_INTERSECTS = 1,
+    HMM_CULL_OUTSIDE    = 2,
+} HMM_FrustumCullResult;
+
+typedef struct HMM_Plane
+{
+    HMM_Vec3 Normal; /* inward-facing, unit length */
+    float    Dist;
+} HMM_Plane;
+
+typedef struct HMM_Frustum
+{
+    /* Left, Right, Bottom, Top, Near, Far (all inward-facing) */
+    HMM_Plane Planes[HMM_CULL_PLANE_COUNT];
+} HMM_Frustum;
+
+typedef struct HMM_Sphere
+{
+    HMM_Vec3 Center;
+    float    Radius;
+} HMM_Sphere;
+
+/* A capsule is the Minkowski sum of segment [A, B] and a sphere of Radius. */
+typedef struct HMM_Capsule
+{
+    HMM_Vec3 A;
+    HMM_Vec3 B;
+    float    Radius;
+} HMM_Capsule;
+
+/* SoA input: HMM_FrustumCullBatchedSpheres reads Count values from each
+   array. The per-component arrays may alias each other, but may not alias
+   OutResults. */
+typedef struct HMM_SphereSoA
+{
+    const float *CenterX;
+    const float *CenterY;
+    const float *CenterZ;
+    const float *Radius;
+    int          Count;
+} HMM_SphereSoA;
+
+typedef struct HMM_CapsuleSoA
+{
+    const float *AX;
+    const float *AY;
+    const float *AZ;
+    const float *BX;
+    const float *BY;
+    const float *BZ;
+    const float *Radius;
+    int          Count;
+} HMM_CapsuleSoA;
+
+typedef struct HMM_FrustumCullOptions
+{
+    int  BatchSize;
+    HMM_Bool ApproxCapsules;
+} HMM_FrustumCullOptions;
+
+/* Extract the six inward-facing, normalized planes of a column-major
+   view-projection matrix (the Gribb/Hartmann construction). */
+static inline HMM_Frustum HMM_FrustumFromVP(HMM_Mat4 VP)
+{
+    HMM_Frustum Result;
+    int PlaneIndex;
+
+    /* HMM_Mat4 is column-major: Elements[col][row]. Copy the four rows into
+       plain row-major arrays first so the plane math below reads naturally.
+       Gribb/Hartmann planes for column-major clip space (w_clip = -z_view)
+       combine row 3 with rows 0..2. Verified directly against
+       HMM_Perspective_RH_NO: Row3 + Row2 yields the near plane with inward
+       normal (0, 0, -1) and offset -Near. */
+    float Row0[4], Row1[4], Row2[4], Row3[4];
+    const int SignX[HMM_CULL_PLANE_COUNT] = { 1, -1,  0,  0,  0,  0};
+    const int SignY[HMM_CULL_PLANE_COUNT] = { 0,  0,  1, -1,  0,  0};
+    const int SignZ[HMM_CULL_PLANE_COUNT] = { 0,  0,  0,  0,  1, -1};
+    int Col;
+
+    for (Col = 0; Col < 4; ++Col)
+    {
+        Row0[Col] = VP.Elements[Col][0];
+        Row1[Col] = VP.Elements[Col][1];
+        Row2[Col] = VP.Elements[Col][2];
+        Row3[Col] = VP.Elements[Col][3];
+    }
+
+    for (PlaneIndex = 0; PlaneIndex < HMM_CULL_PLANE_COUNT; ++PlaneIndex)
+    {
+        HMM_Vec3 Normal;
+        float    Dist;
+        float    InvLen;
+        int      Cx = SignX[PlaneIndex];
+        int      Cy = SignY[PlaneIndex];
+        int      Cz = SignZ[PlaneIndex];
+
+        /* Plane = Row3 + Cx*Row0 + Cy*Row1 + Cz*Row2 (exactly one of
+           Cx/Cy/Cz is +/-1, the rest 0). */
+        Normal.X = Row3[0] + (float)Cx * Row0[0]
+                          + (float)Cy * Row1[0]
+                          + (float)Cz * Row2[0];
+        Normal.Y = Row3[1] + (float)Cx * Row0[1]
+                          + (float)Cy * Row1[1]
+                          + (float)Cz * Row2[1];
+        Normal.Z = Row3[2] + (float)Cx * Row0[2]
+                          + (float)Cy * Row1[2]
+                          + (float)Cz * Row2[2];
+        Dist     = Row3[3] + (float)Cx * Row0[3]
+                          + (float)Cy * Row1[3]
+                          + (float)Cz * Row2[3];
+
+        InvLen = 1.0f / HMM_LenV3(Normal);
+        Result.Planes[PlaneIndex].Normal = HMM_MulV3F(Normal, InvLen);
+        Result.Planes[PlaneIndex].Dist   = Dist * InvLen;
+    }
+
+    return Result;
+}
+
+/* Classify the swept signed-distance interval [Min, Max] of a volume against
+   one plane. Shared by every single-volume and batched test so that all of
+   them perform identical floating point operations. */
+static inline HMM_FrustumCullResult HMM_FrustumClassifyInterval(float Min, float Max)
+{
+    if (Max < 0.0f)
+    {
+        return HMM_CULL_OUTSIDE;
+    }
+    if (Min < 0.0f)
+    {
+        return HMM_CULL_INTERSECTS;
+    }
+    return HMM_CULL_INSIDE;
+}
+
+static inline HMM_FrustumCullResult HMM_FrustumCullSphere(const HMM_Frustum *Frustum,
+                                                          HMM_Sphere Sphere)
+{
+    HMM_FrustumCullResult Result = HMM_CULL_INSIDE;
+    int PlaneIndex;
+
+    for (PlaneIndex = 0; PlaneIndex < HMM_CULL_PLANE_COUNT; ++PlaneIndex)
+    {
+        const HMM_Plane *Plane = &Frustum->Planes[PlaneIndex];
+        float Center = HMM_DotV3(Plane->Normal, Sphere.Center) + Plane->Dist;
+        HMM_FrustumCullResult PlaneResult =
+            HMM_FrustumClassifyInterval(Center - Sphere.Radius,
+                                        Center + Sphere.Radius);
+        if (PlaneResult == HMM_CULL_OUTSIDE)
+        {
+            return HMM_CULL_OUTSIDE;
+        }
+        if (PlaneResult == HMM_CULL_INTERSECTS)
+        {
+            Result = HMM_CULL_INTERSECTS;
+        }
+    }
+
+    return Result;
+}
+
+static inline HMM_FrustumCullResult HMM_FrustumCullCapsule(const HMM_Frustum *Frustum,
+                                                           HMM_Capsule Capsule)
+{
+    HMM_FrustumCullResult Result = HMM_CULL_INSIDE;
+    int PlaneIndex;
+
+    for (PlaneIndex = 0; PlaneIndex < HMM_CULL_PLANE_COUNT; ++PlaneIndex)
+    {
+        const HMM_Plane *Plane = &Frustum->Planes[PlaneIndex];
+        float DA = HMM_DotV3(Plane->Normal, Capsule.A) + Plane->Dist;
+        float DB = HMM_DotV3(Plane->Normal, Capsule.B) + Plane->Dist;
+        float Min = (DA < DB ? DA : DB) - Capsule.Radius;
+        float Max = (DA < DB ? DB : DA) + Capsule.Radius;
+        HMM_FrustumCullResult PlaneResult = HMM_FrustumClassifyInterval(Min, Max);
+        if (PlaneResult == HMM_CULL_OUTSIDE)
+        {
+            return HMM_CULL_OUTSIDE;
+        }
+        if (PlaneResult == HMM_CULL_INTERSECTS)
+        {
+            Result = HMM_CULL_INTERSECTS;
+        }
+    }
+
+    return Result;
+}
+
+/* Batched sphere test. OutResults must hold Spheres->Count entries. The
+   options pointer may be NULL for default behavior. */
+static inline void HMM_FrustumCullBatchedSpheres(
+    const HMM_Frustum *Frustum,
+    const HMM_SphereSoA *Spheres,
+    HMM_FrustumCullResult *OutResults,
+    const HMM_FrustumCullOptions *Options)
+{
+    int BatchSize = (Options != 0 && Options->BatchSize > 0)
+                        ? Options->BatchSize
+                        : HMM_CULL_DEFAULT_BATCH_SIZE;
+    int Base = 0;
+
+    while (Base < Spheres->Count)
+    {
+        int End = Base + BatchSize;
+        int I;
+        if (End > Spheres->Count)
+        {
+            End = Spheres->Count;
+        }
+
+        /* Per-plane accumulators kept in local arrays over a contiguous
+           chunk: each Dot* stream is linear float memory, which is the
+           SIMD-friendly part of the layout. Early-outs happen per volume
+           after all six planes have been evaluated. */
+        for (I = Base; I < End; ++I)
+        {
+            HMM_Vec3 Center;
+            HMM_FrustumCullResult Result = HMM_CULL_INSIDE;
+            int PlaneIndex;
+
+            Center.X = Spheres->CenterX[I];
+            Center.Y = Spheres->CenterY[I];
+            Center.Z = Spheres->CenterZ[I];
+
+            for (PlaneIndex = 0; PlaneIndex < HMM_CULL_PLANE_COUNT; ++PlaneIndex)
+            {
+                const HMM_Plane *Plane = &Frustum->Planes[PlaneIndex];
+                float CenterDist = HMM_DotV3(Plane->Normal, Center) + Plane->Dist;
+                HMM_FrustumCullResult PlaneResult =
+                    HMM_FrustumClassifyInterval(CenterDist - Spheres->Radius[I],
+                                                CenterDist + Spheres->Radius[I]);
+                if (PlaneResult == HMM_CULL_OUTSIDE)
+                {
+                    Result = HMM_CULL_OUTSIDE;
+                }
+                else if (PlaneResult == HMM_CULL_INTERSECTS &&
+                         Result != HMM_CULL_OUTSIDE)
+                {
+                    Result = HMM_CULL_INTERSECTS;
+                }
+            }
+
+            OutResults[I] = Result;
+        }
+
+        Base = End;
+    }
+}
+
+/* Batched capsule test. With ApproxCapsules enabled each capsule is reduced
+   to its bounding sphere (midpoint center, radius half the segment length
+   plus the capsule radius). OutResults must hold Capsules->Count entries.
+   The options pointer may be NULL for default behavior. */
+static inline void HMM_FrustumCullBatchedCapsules(
+    const HMM_Frustum *Frustum,
+    const HMM_CapsuleSoA *Capsules,
+    HMM_FrustumCullResult *OutResults,
+    const HMM_FrustumCullOptions *Options)
+{
+    int BatchSize = (Options != 0 && Options->BatchSize > 0)
+                        ? Options->BatchSize
+                        : HMM_CULL_DEFAULT_BATCH_SIZE;
+    HMM_Bool Approximate = (Options != 0) ? Options->ApproxCapsules : 0;
+    int Base = 0;
+
+    while (Base < Capsules->Count)
+    {
+        int End = Base + BatchSize;
+        int I;
+        if (End > Capsules->Count)
+        {
+            End = Capsules->Count;
+        }
+
+        for (I = Base; I < End; ++I)
+        {
+            HMM_Vec3 A;
+            HMM_Vec3 B;
+            HMM_FrustumCullResult Result = HMM_CULL_INSIDE;
+            int PlaneIndex;
+            /* The bounding sphere of a capsule is fixed per volume, so its
+               midpoint and radius are computed once and reused on all six
+               planes. Radius-0 and point capsules (A == B) reduce to a
+               sphere exactly as the exact path does. */
+            HMM_Vec3 Mid;
+            float BoundingRadius = 0.0f;
+
+            A.X = Capsules->AX[I];
+            A.Y = Capsules->AY[I];
+            A.Z = Capsules->AZ[I];
+            B.X = Capsules->BX[I];
+            B.Y = Capsules->BY[I];
+            B.Z = Capsules->BZ[I];
+
+            if (Approximate)
+            {
+                Mid.X = (A.X + B.X) * 0.5f;
+                Mid.Y = (A.Y + B.Y) * 0.5f;
+                Mid.Z = (A.Z + B.Z) * 0.5f;
+                BoundingRadius =
+                    HMM_LenV3(HMM_SubV3(B, A)) * 0.5f + Capsules->Radius[I];
+            }
+
+            for (PlaneIndex = 0; PlaneIndex < HMM_CULL_PLANE_COUNT; ++PlaneIndex)
+            {
+                const HMM_Plane *Plane = &Frustum->Planes[PlaneIndex];
+                float Min;
+                float Max;
+                HMM_FrustumCullResult PlaneResult;
+
+                if (Approximate)
+                {
+                    float CenterDist = HMM_DotV3(Plane->Normal, Mid) + Plane->Dist;
+                    Min = CenterDist - BoundingRadius;
+                    Max = CenterDist + BoundingRadius;
+                }
+                else
+                {
+                    float DA = HMM_DotV3(Plane->Normal, A) + Plane->Dist;
+                    float DB = HMM_DotV3(Plane->Normal, B) + Plane->Dist;
+                    Min = (DA < DB ? DA : DB) - Capsules->Radius[I];
+                    Max = (DA < DB ? DB : DA) + Capsules->Radius[I];
+                }
+
+                PlaneResult = HMM_FrustumClassifyInterval(Min, Max);
+                if (PlaneResult == HMM_CULL_OUTSIDE)
+                {
+                    Result = HMM_CULL_OUTSIDE;
+                }
+                else if (PlaneResult == HMM_CULL_INTERSECTS &&
+                         Result != HMM_CULL_OUTSIDE)
+                {
+                    Result = HMM_CULL_INTERSECTS;
+                }
+            }
+
+            OutResults[I] = Result;
+        }
+
+        Base = End;
+    }
+}
+
 
 #ifdef __cplusplus
 }
