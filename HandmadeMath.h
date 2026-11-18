@@ -2656,6 +2656,234 @@ static inline HMM_Vec3 HMM_RotateV3AxisAngle_RH(HMM_Vec3 V, HMM_Vec3 Axis, float
     return HMM_RotateV3Q(V, HMM_QFromAxisAngle_RH(Axis, Angle));
 }
 
+/*
+ * so(3) exponential and logarithmic maps
+ *
+ * The so(3) exponential map takes an angular velocity vector W (an axis of
+ * rotation scaled by the angle of rotation, in radians) and produces the
+ * corresponding rotation matrix. Its inverse, the logarithmic map, recovers
+ * the angular velocity vector from a rotation matrix.
+ *
+ * The conventions match HMM_Rotate_RH / HMM_QFromAxisAngle_RH: the angle
+ * follows the right-hand rule about the axis and the matrix is column-major.
+ */
+
+/*
+ * Exponential map from so(3) to SO(3), implemented with Rodrigues' formula:
+ *
+ *   R = I + (sin(theta) / theta) K + ((1 - cos(theta)) / theta^2) K^2
+ *
+ * where theta = |W| and K is the skew-symmetric cross-product matrix of W/theta.
+ *
+ * For a very small theta the ratios have a 0/0 limit, so a third-order Taylor
+ * expansion (I + K + K^2/2) is used instead, which needs no division by theta
+ * at all and therefore can never produce a NaN as theta approaches zero.
+ */
+static inline HMM_Mat3 HMM_ExpSO3(HMM_Vec3 W)
+{
+    /* Below this angle (radians) the Taylor branch is numerically superior to
+       the divided Rodrigues coefficients. */
+    const float SmallAngle = 1.0e-4f;
+
+    HMM_Mat3 Result;
+
+    float ThetaSquared = HMM_DotV3(W, W);
+
+    if (ThetaSquared < SmallAngle * SmallAngle)
+    {
+        /* Taylor expansion of the exponential map through third order:
+           R ~= I + [W] + 0.5 * [W]^2, relative error O(theta^4). */
+        float Half = 0.5f;
+
+        Result.Elements[0][0] = 1.0f + Half * (W.X * W.X - ThetaSquared);
+        Result.Elements[0][1] = Half * W.X * W.Y + W.Z;
+        Result.Elements[0][2] = Half * W.X * W.Z - W.Y;
+
+        Result.Elements[1][0] = Half * W.X * W.Y - W.Z;
+        Result.Elements[1][1] = 1.0f + Half * (W.Y * W.Y - ThetaSquared);
+        Result.Elements[1][2] = Half * W.Y * W.Z + W.X;
+
+        Result.Elements[2][0] = Half * W.X * W.Z + W.Y;
+        Result.Elements[2][1] = Half * W.Y * W.Z - W.X;
+        Result.Elements[2][2] = 1.0f + Half * (W.Z * W.Z - ThetaSquared);
+    }
+    else
+    {
+        float Theta = HMM_SqrtF(ThetaSquared);
+        float SinOverTheta = HMM_SinF(Theta) / Theta;
+        float OneMinusCosOverThetaSq =
+            (1.0f - HMM_CosF(Theta)) / ThetaSquared;
+
+        Result.Elements[0][0] = 1.0f + OneMinusCosOverThetaSq * (W.X * W.X - ThetaSquared);
+        Result.Elements[0][1] = OneMinusCosOverThetaSq * W.X * W.Y + SinOverTheta * W.Z;
+        Result.Elements[0][2] = OneMinusCosOverThetaSq * W.X * W.Z - SinOverTheta * W.Y;
+
+        Result.Elements[1][0] = OneMinusCosOverThetaSq * W.X * W.Y - SinOverTheta * W.Z;
+        Result.Elements[1][1] = 1.0f + OneMinusCosOverThetaSq * (W.Y * W.Y - ThetaSquared);
+        Result.Elements[1][2] = OneMinusCosOverThetaSq * W.Y * W.Z + SinOverTheta * W.X;
+
+        Result.Elements[2][0] = OneMinusCosOverThetaSq * W.X * W.Z + SinOverTheta * W.Y;
+        Result.Elements[2][1] = OneMinusCosOverThetaSq * W.Y * W.Z - SinOverTheta * W.X;
+        Result.Elements[2][2] = 1.0f + OneMinusCosOverThetaSq * (W.Z * W.Z - ThetaSquared);
+    }
+
+    return Result;
+}
+
+/*
+ * Logarithmic map from SO(3) back to so(3), the inverse of HMM_ExpSO3:
+ *
+ *   theta = acos((trace(R) - 1) / 2)
+ *   W     = theta / (2 * sin(theta)) * [R32 - R23, R13 - R31, R21 - R12]
+ *
+ * Three cases are handled:
+ *
+ *   1. Small theta: dividing by sin(theta) is ill-conditioned, so a Taylor
+ *      expansion (W ~= [skew part] * (1 + theta^2/6)) is used instead.
+ *   2. General theta: the standard acos/sin formula above.
+ *   3. theta close to pi: sin(theta) approaches zero and the formula loses
+ *      all accuracy. The rotation is converted to a quaternion with the
+ *      numerically stable Shepperd branch (the same method as HMM_M4ToQ_RH)
+ *      and W = 2 * acos(q.w) * q.xyz / |q.xyz|. The branch is selected when
+ *      (trace(R) - 1) / 2 < -0.5, i.e. theta > ~2.09 rad (120 degrees),
+ *      which is where the divided formula's error starts exceeding the
+ *      library's single-precision round-trip budget.
+ */
+static inline HMM_Vec3 HMM_LogSO3(HMM_Mat3 R)
+{
+    /* The small-angle test works on the skew part whose magnitude is
+       2*sin(theta), so the threshold is scaled by 2 relative to the angle
+       cutoff (~7.5e-4 rad). It also comfortably covers every matrix the exp
+       Taylor branch can emit, which keeps the general formula away from
+       angles where sin(theta) underflows to zero in float. */
+    const float LogSmallAngle = 1.5e-3f;
+    /* The divided acos/sin formula loses roughly a digit of accuracy once
+       sin(theta) gets small, so hand off to the quaternion branch already at
+       cos(theta) < -0.5, i.e. theta > ~2.09 rad (120 degrees). */
+    const float QuatBranchCosTheta = -0.5f;
+
+    HMM_Vec3 Result;
+
+    float CosTheta = HMM_Clamp(-1.0f,
+        (R.Elements[0][0] + R.Elements[1][1] + R.Elements[2][2] - 1.0f) * 0.5f,
+        1.0f);
+
+    /* Skew (antisymmetric) part of R: with the column-major convention its
+       magnitude is |2 * sin(theta)|. Unlike a trace/cos(theta) test it keeps
+       its information all the way down to theta = 0, so it also selects the
+       Taylor branch at the tiny angles where 1 - cos(theta) rounds to zero. */
+    HMM_Vec3 HalfSkew = HMM_V3(
+        R.Elements[1][2] - R.Elements[2][1],
+        R.Elements[2][0] - R.Elements[0][2],
+        R.Elements[0][1] - R.Elements[1][0]
+    );
+
+    if (CosTheta < QuatBranchCosTheta)
+    {
+        /* Near-pi branch: recover the axis-angle through a quaternion built
+           with Shepperd's method. The largest of the four quaternion
+           components is computed from a sum, so no subtractive cancellation
+           can destabilize the result. */
+        HMM_Quat Q;
+        float T;
+
+        if (R.Elements[2][2] < 0.0f) {
+            if (R.Elements[0][0] > R.Elements[1][1]) {
+                T = 1.0f + R.Elements[0][0] - R.Elements[1][1] - R.Elements[2][2];
+                Q = HMM_Q(
+                    T,
+                    R.Elements[0][1] + R.Elements[1][0],
+                    R.Elements[2][0] + R.Elements[0][2],
+                    R.Elements[1][2] - R.Elements[2][1]
+                );
+            } else {
+                T = 1.0f - R.Elements[0][0] + R.Elements[1][1] - R.Elements[2][2];
+                Q = HMM_Q(
+                    R.Elements[0][1] + R.Elements[1][0],
+                    T,
+                    R.Elements[1][2] + R.Elements[2][1],
+                    R.Elements[2][0] - R.Elements[0][2]
+                );
+            }
+        } else {
+            if (R.Elements[0][0] < -R.Elements[1][1]) {
+                T = 1.0f - R.Elements[0][0] - R.Elements[1][1] + R.Elements[2][2];
+                Q = HMM_Q(
+                    R.Elements[2][0] + R.Elements[0][2],
+                    R.Elements[1][2] + R.Elements[2][1],
+                    T,
+                    R.Elements[0][1] - R.Elements[1][0]
+                );
+            } else {
+                T = 1.0f + R.Elements[0][0] + R.Elements[1][1] + R.Elements[2][2];
+                Q = HMM_Q(
+                    R.Elements[1][2] - R.Elements[2][1],
+                    R.Elements[2][0] - R.Elements[0][2],
+                    R.Elements[0][1] - R.Elements[1][0],
+                    T
+                );
+            }
+        }
+
+        Q = HMM_MulQF(Q, 0.5f / HMM_SqrtF(T));
+
+        /* Canonicalize so W >= 0: the log map's range is |W| <= pi. */
+        if (Q.W < 0.0f)
+        {
+            Q.X = -Q.X;
+            Q.Y = -Q.Y;
+            Q.Z = -Q.Z;
+            Q.W = -Q.W;
+        }
+
+        float Angle = 2.0f * HMM_ACosF(HMM_Clamp(-1.0f, Q.W, 1.0f));
+        float AxisLength = HMM_SqrtF(HMM_DotV3(Q.XYZ, Q.XYZ));
+
+        if (AxisLength < 1.0e-8f)
+        {
+            /* Defensive fallback: a pure-identity matrix has no axis. */
+            return HMM_V3(0.0f, 0.0f, 0.0f);
+        }
+
+        Result = HMM_MulV3F(Q.XYZ, Angle / AxisLength);
+    }
+    else if (HMM_LenSqrV3(HalfSkew) < LogSmallAngle * LogSmallAngle)
+    {
+        /* Small-angle Taylor branch: the skew part is 2*sin(theta)*axis, so
+           multiplying by (theta/sin(theta))/2 ~= 0.5*(1 + theta^2/6) yields
+           theta*axis directly. No division by sin(theta), hence no 0/0 at the
+           identity. The squared term is accumulated in double precision: at
+           theta ~ 1e-8 it would underflow to zero in float and silently drop
+           the correction. */
+        double ThetaSquared = 2.0 * (double)HMM_DotV3(HalfSkew, HalfSkew);
+        float Scale = (float)(0.5 * (1.0 + ThetaSquared / 6.0));
+        Result = HMM_MulV3F(HalfSkew, Scale);
+    }
+    else
+    {
+        /* General branch: standard acos / sin logarithmic map. */
+        float Theta = HMM_ACosF(CosTheta);
+        float SinTheta = HMM_SinF(Theta);
+
+        if (SinTheta == 0.0f)
+        {
+            /* Defensive fallback: at this angle sin(theta) has underflowed to
+               zero in float, so theta/sin(theta) cannot be formed. Reuse the
+               Taylor branch, which needs no such division. */
+            double ThetaSquared = 2.0 * (double)HMM_DotV3(HalfSkew, HalfSkew);
+            float Scale = (float)(0.5 * (1.0 + ThetaSquared / 6.0));
+            Result = HMM_MulV3F(HalfSkew, Scale);
+        }
+        else
+        {
+            float Scale = Theta / (2.0f * SinTheta);
+            Result = HMM_MulV3F(HalfSkew, Scale);
+        }
+    }
+
+    return Result;
+}
+
 
 #ifdef __cplusplus
 }
