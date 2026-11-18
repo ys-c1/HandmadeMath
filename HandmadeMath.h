@@ -1592,6 +1592,245 @@ static inline HMM_Mat4 HMM_MulM4(HMM_Mat4 Left, HMM_Mat4 Right)
     return Result;
 }
 
+/*
+ * Batch 4x4 matrix multiplication.
+ *
+ * Computes Out[i] = Left[i] * Right[i] for i in [0, Count). The operation
+ * order of every float multiply/add is identical to the scalar path of
+ * HMM_LinearCombineV4M4 (one product per row, accumulated left-to-right),
+ * so the results are bit-for-bit equal to a naive triple loop regardless
+ * of whether the SSE path is active. The SSE path uses separate mul and
+ * add instructions (no fused multiply-add), which is what preserves the
+ * bit-exactness.
+ *
+ * Optimizations over a naive triple loop over the batch:
+ *   - Tiling over the batch dimension (HMM_MATMUL_BATCH_TILE) so each
+ *     tile's working set stays hot in L1.
+ *   - Fully unrolled register microkernel: each 4x4 product is kept in
+ *     registers, no inner-loop bookkeeping or stack traffic.
+ *   - Two independent products interleaved per iteration so the CPU can
+ *     overlap their independent dependency chains.
+ *   - Aligned SSE loads/stores (_mm_load_ps/_mm_store_ps) when all three
+ *     arrays are 16-byte aligned; unaligned SSE loads otherwise. The
+ *     scalar fallback (HANDMADE_MATH_NO_SIMD, or non-x86 targets) uses
+ *     plain scalar accesses and needs no alignment at all.
+ */
+#ifndef HMM_MATMUL_BATCH_TILE
+# define HMM_MATMUL_BATCH_TILE 64
+#endif
+
+/* 16-byte alignment test without pulling in <stdint.h> (freestanding). */
+#define HMM_MATMUL__IS_ALIGNED16(P) \
+    ((((unsigned long)(const void *)(P)) & 15UL) == 0UL)
+
+#ifdef HANDMADE_MATH__USE_SSE
+/* One linear combine using explicit loads. The arithmetic expression is
+ * the library's existing SSE HMM_LinearCombineV4M4 expression (mul, then
+ * three mul+add), only the load instructions differ. */
+static inline __m128 HMM_MulM4Batch__LinearCombineSSE(__m128 L,
+                                                      const HMM_Mat4 *M,
+                                                      int Aligned)
+{
+    __m128 C0 = Aligned ? _mm_load_ps((const float *)&M->Columns[0].SSE)
+                        : _mm_loadu_ps((const float *)&M->Columns[0].SSE);
+    __m128 C1 = Aligned ? _mm_load_ps((const float *)&M->Columns[1].SSE)
+                        : _mm_loadu_ps((const float *)&M->Columns[1].SSE);
+    __m128 C2 = Aligned ? _mm_load_ps((const float *)&M->Columns[2].SSE)
+                        : _mm_loadu_ps((const float *)&M->Columns[2].SSE);
+    __m128 C3 = Aligned ? _mm_load_ps((const float *)&M->Columns[3].SSE)
+                        : _mm_loadu_ps((const float *)&M->Columns[3].SSE);
+    __m128 Result;
+
+    Result = _mm_mul_ps(_mm_shuffle_ps(L, L, 0x00), C0);
+    Result = _mm_add_ps(Result,
+                        _mm_mul_ps(_mm_shuffle_ps(L, L, 0x55), C1));
+    Result = _mm_add_ps(Result,
+                        _mm_mul_ps(_mm_shuffle_ps(L, L, 0xaa), C2));
+    Result = _mm_add_ps(Result,
+                        _mm_mul_ps(_mm_shuffle_ps(L, L, 0xff), C3));
+
+    return Result;
+}
+
+COVERAGE(HMM_MulM4BatchSSEKernel, 1)
+static inline void HMM_MulM4Batch__SSEKernel(const HMM_Mat4 *Left,
+                                             const HMM_Mat4 *Right,
+                                             HMM_Mat4 *Out, int Aligned)
+{
+    __m128 R0, R1, R2, R3;
+    __m128 L;
+
+    ASSERT_COVERED(HMM_MulM4BatchSSEKernel);
+
+    /* All arithmetic stays in registers; memory is touched once by
+     * the explicit aligned/unaligned stores below. The four columns
+     * are fully unrolled so the compiler sees all independent chains. */
+    L = Aligned ? _mm_load_ps((const float *)&Right->Columns[0].SSE)
+                : _mm_loadu_ps((const float *)&Right->Columns[0].SSE);
+    R0 = HMM_MulM4Batch__LinearCombineSSE(L, Left, Aligned);
+    L = Aligned ? _mm_load_ps((const float *)&Right->Columns[1].SSE)
+                : _mm_loadu_ps((const float *)&Right->Columns[1].SSE);
+    R1 = HMM_MulM4Batch__LinearCombineSSE(L, Left, Aligned);
+    L = Aligned ? _mm_load_ps((const float *)&Right->Columns[2].SSE)
+                : _mm_loadu_ps((const float *)&Right->Columns[2].SSE);
+    R2 = HMM_MulM4Batch__LinearCombineSSE(L, Left, Aligned);
+    L = Aligned ? _mm_load_ps((const float *)&Right->Columns[3].SSE)
+                : _mm_loadu_ps((const float *)&Right->Columns[3].SSE);
+    R3 = HMM_MulM4Batch__LinearCombineSSE(L, Left, Aligned);
+
+    /* Explicit aligned/unaligned stores through the pointer: this is
+     * what makes the unaligned-input path safe even though HMM_Mat4
+     * contains an __m128 member (plain struct assignment could be
+     * lowered to an aligned movaps and fault). */
+    if (Aligned)
+    {
+        _mm_store_ps((float *)&Out->Columns[0].SSE, R0);
+        _mm_store_ps((float *)&Out->Columns[1].SSE, R1);
+        _mm_store_ps((float *)&Out->Columns[2].SSE, R2);
+        _mm_store_ps((float *)&Out->Columns[3].SSE, R3);
+    }
+    else
+    {
+        _mm_storeu_ps((float *)&Out->Columns[0].SSE, R0);
+        _mm_storeu_ps((float *)&Out->Columns[1].SSE, R1);
+        _mm_storeu_ps((float *)&Out->Columns[2].SSE, R2);
+        _mm_storeu_ps((float *)&Out->Columns[3].SSE, R3);
+    }
+}
+#else /* scalar fallback: HANDMADE_MATH_NO_SIMD, or non-x86 targets */
+COVERAGE(HMM_MulM4BatchScalarKernel, 1)
+static inline void HMM_MulM4Batch__ScalarKernel(const HMM_Mat4 *Left,
+                                                const HMM_Mat4 *Right,
+                                                HMM_Mat4 *Out)
+{
+    /* Fully unrolled, accumulating into plain local floats rather than
+     * straight through the Out pointer. Keeping intermediates in locals
+     * (a) lets every compiler hold them in registers instead of bouncing
+     * them through memory on alias concerns, and (b) still needs no
+     * alignment. The evaluation order per output element is identical to
+     * the scalar HMM_LinearCombineV4M4 path -- first product assigned,
+     * then the remaining three added left-to-right -- so results are
+     * bit-identical; only where the temporaries live has changed. */
+    HMM_Vec4 L;
+    float x, y, z, w;
+
+#define HMM_BATCH__SCALAR_COLUMN(COL)                                          \
+    L = Right->Columns[COL];                                                   \
+    x = L.Elements[0] * Left->Columns[0].X;                                    \
+    y = L.Elements[0] * Left->Columns[0].Y;                                    \
+    z = L.Elements[0] * Left->Columns[0].Z;                                    \
+    w = L.Elements[0] * Left->Columns[0].W;                                    \
+    x += L.Elements[1] * Left->Columns[1].X;                                   \
+    y += L.Elements[1] * Left->Columns[1].Y;                                   \
+    z += L.Elements[1] * Left->Columns[1].Z;                                   \
+    w += L.Elements[1] * Left->Columns[1].W;                                   \
+    x += L.Elements[2] * Left->Columns[2].X;                                   \
+    y += L.Elements[2] * Left->Columns[2].Y;                                   \
+    z += L.Elements[2] * Left->Columns[2].Z;                                   \
+    w += L.Elements[2] * Left->Columns[2].W;                                   \
+    x += L.Elements[3] * Left->Columns[3].X;                                   \
+    y += L.Elements[3] * Left->Columns[3].Y;                                   \
+    z += L.Elements[3] * Left->Columns[3].Z;                                   \
+    w += L.Elements[3] * Left->Columns[3].W;                                   \
+    Out->Columns[COL].X = x;                                                   \
+    Out->Columns[COL].Y = y;                                                   \
+    Out->Columns[COL].Z = z;                                                   \
+    Out->Columns[COL].W = w
+
+    ASSERT_COVERED(HMM_MulM4BatchScalarKernel);
+
+    HMM_BATCH__SCALAR_COLUMN(0);
+    HMM_BATCH__SCALAR_COLUMN(1);
+    HMM_BATCH__SCALAR_COLUMN(2);
+    HMM_BATCH__SCALAR_COLUMN(3);
+
+#undef HMM_BATCH__SCALAR_COLUMN
+}
+#endif /* HANDMADE_MATH__USE_SSE */
+
+COVERAGE(HMM_MulM4Batch, 1)
+static inline void HMM_MulM4Batch(const HMM_Mat4 *Left,
+                                  const HMM_Mat4 *Right,
+                                  HMM_Mat4 *Out, int Count)
+{
+    ASSERT_COVERED(HMM_MulM4Batch);
+
+    if (Count <= 0 || Left == 0 || Right == 0 || Out == 0)
+    {
+        return;
+    }
+
+#ifdef HANDMADE_MATH__USE_SSE
+    {
+        int Aligned = HMM_MATMUL__IS_ALIGNED16(Left)
+                   && HMM_MATMUL__IS_ALIGNED16(Right)
+                   && HMM_MATMUL__IS_ALIGNED16(Out);
+        int TileStart = 0;
+
+        /* Batch-dimension tiling: one tile's three arrays fit in L1. */
+        while (TileStart < Count)
+        {
+            /* Compare against the remaining length instead of adding,
+             * so an oversized HMM_MATMUL_BATCH_TILE cannot overflow. */
+            int TileLen = Count - TileStart;
+            int TileEnd, i;
+            if (TileLen > HMM_MATMUL_BATCH_TILE)
+            {
+                TileLen = HMM_MATMUL_BATCH_TILE;
+            }
+            TileEnd = TileStart + TileLen;
+
+            /* Two independent products per iteration (ILP). */
+            for (i = TileStart; i + 1 < TileEnd; i += 2)
+            {
+                HMM_MulM4Batch__SSEKernel(&Left[i], &Right[i],
+                                          &Out[i], Aligned);
+                HMM_MulM4Batch__SSEKernel(&Left[i + 1], &Right[i + 1],
+                                          &Out[i + 1], Aligned);
+            }
+            if (i < TileEnd)
+            {
+                HMM_MulM4Batch__SSEKernel(&Left[i], &Right[i],
+                                          &Out[i], Aligned);
+            }
+
+            TileStart = TileEnd;
+        }
+    }
+#else
+    {
+        int TileStart = 0;
+
+        /* Same tiling and interleave as the SSE path, scalar microkernel. */
+        while (TileStart < Count)
+        {
+            int TileLen = Count - TileStart;
+            int TileEnd, i;
+            if (TileLen > HMM_MATMUL_BATCH_TILE)
+            {
+                TileLen = HMM_MATMUL_BATCH_TILE;
+            }
+            TileEnd = TileStart + TileLen;
+
+            for (i = TileStart; i + 1 < TileEnd; i += 2)
+            {
+                HMM_MulM4Batch__ScalarKernel(&Left[i], &Right[i], &Out[i]);
+                HMM_MulM4Batch__ScalarKernel(&Left[i + 1], &Right[i + 1],
+                                             &Out[i + 1]);
+            }
+            if (i < TileEnd)
+            {
+                HMM_MulM4Batch__ScalarKernel(&Left[i], &Right[i], &Out[i]);
+            }
+
+            TileStart = TileEnd;
+        }
+    }
+#endif
+}
+
+#undef HMM_MATMUL__IS_ALIGNED16
+
 COVERAGE(HMM_MulM4F, 1)
 static inline HMM_Mat4 HMM_MulM4F(HMM_Mat4 Matrix, float Scalar)
 {
